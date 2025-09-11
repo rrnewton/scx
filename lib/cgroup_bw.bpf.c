@@ -1055,10 +1055,53 @@ int scx_cgroup_bw_consume(struct cgroup *cgrp __arg_trusted, int llc_id, u64 res
 	return 0;
 }
 
+/**
+ * scx_cgroup_bw_put_aside - Put aside a task to execute it when the cgroup is
+ * unthrottled later.
+ * @p: a task to be put aside since the cgroup is throttled.
+ * @vtime: vtime of a task @p.
+ * @cgrp: cgroup where a task belongs to.
+ * @llc_id: caller's LLC id.
+ *
+ * When a cgroup is throttled (i.e., scx_cgroup_bw_reserve() returns -EAGAIN),
+ * a task that is in the ops.enqueue() path should be put aside to the BTQ of
+ * its associated LLC context. When the cgroup becomes unthrottled again,
+ * the registered enqueue_cb() will be called to re-enqueue the task for
+ * execution.
+ *
+ * Return 0 for success, -errno for failure.
+ */
 __hidden
 int scx_cgroup_bw_put_aside(struct task_struct *p __arg_trusted, u64 vtime, struct cgroup *cgrp __arg_trusted, int llc_id)
 {
-	return -ENOTSUP;
+	struct scx_cgroup_llc_ctx *llcx;
+	int ret;
+
+	/* Sanity check LLC ID. */
+	if (!is_llc_id_valid(llc_id)) {
+		cbw_err("Invalid LLC id: %d", llc_id);
+		return -EINVAL;
+	}
+
+	/*
+	 * Put aside the task to the BTQ of the LLC context.
+	 */
+	llcx = cbw_get_llc_ctx(cgrp, llc_id);
+	if (!llcx) {
+		cbw_err("Failed to lookup an LLC ctx");
+		return -ESRCH;
+	}
+
+	if (!llcx->btq) {
+		cbw_err("BTQ of an LLC ctx is not properly initialized.");
+		return -ESRCH;
+	}
+
+	ret = scx_atq_insert_vtime(llcx->btq, (u64)p->pid, vtime);
+	if (ret)
+		cbw_err("Failed to insert a task to BTQ: %d", ret);
+
+	return ret;
 }
 
 /*
