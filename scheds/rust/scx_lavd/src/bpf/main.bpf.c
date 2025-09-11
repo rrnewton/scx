@@ -188,6 +188,7 @@
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
+#include <lib/cgroup.h>
 
 char _license[] SEC("license") = "GPL";
 
@@ -1293,7 +1294,7 @@ void BPF_STRUCT_OPS(lavd_set_cpumask, struct task_struct *p,
 		return;
 	}
 
-	if (bpf_cpumask_weight(p->cpus_ptr) != __nr_cpu_ids)
+	if (bpf_cpumask_weight(p->cpus_ptr) != nr_cpu_ids)
 		set_task_flag(taskc, LAVD_FLAG_IS_AFFINITIZED);
 	else
 		reset_task_flag(taskc, LAVD_FLAG_IS_AFFINITIZED);
@@ -1389,7 +1390,7 @@ static void init_task_ctx(struct task_struct *p, struct task_ctx *taskc)
 	u64 now = scx_bpf_now();
 
 	__builtin_memset(taskc, 0, sizeof(*taskc));
-	if (bpf_cpumask_weight(p->cpus_ptr) != __nr_cpu_ids)
+	if (bpf_cpumask_weight(p->cpus_ptr) != nr_cpu_ids)
 		set_task_flag(taskc, LAVD_FLAG_IS_AFFINITIZED);
 	else
 		reset_task_flag(taskc, LAVD_FLAG_IS_AFFINITIZED);
@@ -1561,7 +1562,7 @@ static s32 init_per_cpu_ctx(u64 now)
 	 * Initilize CPU info
 	 */
 	one_little_capacity = LAVD_SCALE;
-	bpf_for(cpu, 0, __nr_cpu_ids) {
+	bpf_for(cpu, 0, nr_cpu_ids) {
 		if (cpu >= LAVD_CPU_ID_MAX)
 			break;
 
@@ -1685,7 +1686,7 @@ static s32 init_per_cpu_ctx(u64 now)
 	/*
 	 * Print some useful informatin for debugging.
 	 */
-	bpf_for(cpu, 0, __nr_cpu_ids) {
+	bpf_for(cpu, 0, nr_cpu_ids) {
 		cpuc = get_cpu_ctx_id(cpu);
 		if (!cpuc) {
 			scx_bpf_error("Failed to lookup cpu_ctx: %d", cpu);
@@ -1711,7 +1712,7 @@ static int init_per_cpu_dsqs(void)
 	struct cpu_ctx *cpuc;
 	int cpu, err = 0;
 
-	bpf_for(cpu, 0, __nr_cpu_ids) {
+	bpf_for(cpu, 0, nr_cpu_ids) {
 		/*
 		 * Create Per-CPU DSQs on its associated NUMA domain.
 		 */
@@ -1741,6 +1742,51 @@ static int init_per_cpu_dsqs(void)
 	return 0;
 }
 
+s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_cgroup_init, struct cgroup *cgrp,
+			     struct scx_cgroup_init_args *args)
+{
+	int ret;
+
+	if (!enable_cpu_bw)
+		return 0;
+
+	ret = scx_cgroup_bw_init(cgrp, args);
+	if (ret)
+	       scx_bpf_error("Failed to init a cgroup: %d", ret);
+	return ret;
+}
+
+void BPF_STRUCT_OPS(lavd_cgroup_exit, struct cgroup *cgrp)
+{
+	int ret;
+
+	if (!enable_cpu_bw)
+		return;
+
+	ret = scx_cgroup_bw_exit(cgrp);
+	if (ret)
+	       scx_bpf_error("Failed to exit a cgroup: %d", ret);
+}
+
+void BPF_STRUCT_OPS(lavd_cgroup_set_bandwidth, struct cgroup *cgrp,
+		    u64 period_us, u64 quota_us, u64 burst_us)
+{
+	int ret;
+
+	if (!enable_cpu_bw)
+		return;
+
+	ret = scx_cgroup_bw_set(cgrp, period_us, quota_us, burst_us);
+	if (ret)
+	       scx_bpf_error("Failed to set bandwidth of a cgroup: %d", ret);
+}
+
+int lavd_enqueue_cb(pid_t pid)
+{
+	/* TODO: to be implemnted */
+	return 0;
+}
+REGISTER_SCX_CGROUP_BW_ENQUEUE_CB(lavd_enqueue_cb);
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init)
 {
@@ -1799,6 +1845,19 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init)
 	WRITE_ONCE(cur_logical_clk, 0);
 	WRITE_ONCE(cur_svc_time, 0);
 
+	/*
+	 * Initialize cpu.max library if enabled.
+	 */
+	if (enable_cpu_bw) {
+		struct scx_cgroup_bw_config bw_config = {
+			.budget_p2c = slice_max_ns * 20,
+			.budget_c2l = slice_max_ns * 10,
+			.nr_llcs = nr_llcs,
+			.verbose = verbose,
+		};
+		err = scx_cgroup_bw_lib_init(&bw_config);
+	}
+
 	return err;
 }
 
@@ -1824,6 +1883,9 @@ SCX_OPS_DEFINE(lavd_ops,
 	       .cpu_release		= (void *)lavd_cpu_release,
 	       .enable			= (void *)lavd_enable,
 	       .init_task		= (void *)lavd_init_task,
+	       .cgroup_init		= (void *)lavd_cgroup_init,
+	       .cgroup_exit		= (void *)lavd_cgroup_exit,
+	       .cgroup_set_bandwidth	= (void *)lavd_cgroup_set_bandwidth,
 	       .init			= (void *)lavd_init,
 	       .exit			= (void *)lavd_exit,
 	       .timeout_ms		= 30000U,
