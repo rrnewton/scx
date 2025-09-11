@@ -19,6 +19,8 @@ enum scx_cgroup_consts {
 	CBW_NR_CGRP_MAX			= 2048,
 	/* maximum number of scx_cgroup_llc_ctx: 2048 cgroups * 32 LLCs */
 	CBW_NR_CGRP_LLC_MAX		= (CBW_NR_CGRP_MAX * 32),
+	/* The maximum height of a cgroup tree. */
+	CBW_CGRP_TREE_HEIGHT_MAX	= 16,
 	/* unlimited quota ("max") */
 	CBW_RUNTUME_INF			= ((u64)~0ULL),
 	/* maximum number of backlog tasks in an LLC context */
@@ -206,6 +208,11 @@ int replenish_timerfn(void *map, int *key, struct bpf_timer *timer);
 #ifndef clamp
 #define clamp(val, lo, hi) min(max(val, lo), hi)
 #endif
+
+static u64 div_round_up(u64 dividend, u64 divisor)
+{
+	return (dividend + divisor - 1) / divisor;
+}
 
 /*
  * Check if the kernel support cpu.max for scx schedulers.
@@ -612,10 +619,382 @@ unlock_out:
 	return ret;
 }
 
+static
+bool is_llc_id_valid(int llc_id)
+{
+	return llc_id >= 0 && llc_id < cbw_config.nr_llcs;
+}
+
+static
+s32 cbw_sum_rumtime_total_llcx(struct cgroup *cgrp __arg_trusted,
+			       struct scx_cgroup_ctx *cgx)
+{
+	struct scx_cgroup_llc_ctx *llcx;
+	s64 sum;
+	int i;
+
+	if (!cgx->has_llcx)
+		return 0;
+
+	sum = 0;
+	bpf_for(i, 0, cbw_config.nr_llcs) {
+		llcx = cbw_get_llc_ctx(cgrp, i);
+		if (!llcx)
+			break;
+		sum += READ_ONCE(llcx->runtime_total);
+	}
+	return sum;
+}
+
+static
+int cbw_update_runtime_total_sloppy(struct cgroup *cgrp __arg_trusted)
+{
+	struct cgroup *cur_cgrp;
+	struct scx_cgroup_ctx *cur_cgx = NULL;
+	struct cgroup_subsys_state *subroot_css, *pos;
+	s64 rt_llcx, rts_level[CBW_CGRP_TREE_HEIGHT_MAX];
+	int cur_level, prev_level = -EINVAL, nr_cgrps = 0, ret = 0;
+
+	__builtin_memset(rts_level, 0, sizeof(rts_level));
+
+	/*
+	 * Suppose the following cgroup hierarchy with cgroup name and level.
+	 * (cgroup_root:0
+	 *	(A:1
+	 *		(D:2
+	 *		 E:2))
+	 *	(B:1)
+	 *	(C:1
+	 *		(F:2
+	 *		 G:2)))
+	 *
+	 * The post-order traversal of the tree is as follows:
+	 *   D:2 -> E:2 -> A:1 -> B:1 -> F:2 -> G:2 -> C:1 -> cgroup_root:0
+	 *
+	 * We traverse the tree in a post-order (left-right-self). We first
+	 * update the runtime_total_sloppy (rts) to the fresh value. Then,
+	 * we aggregate the runtime_total_sloppy values at the same level
+	 * (e.g., D:2 and E:2). When we visit an upper level (e.g., A:1),
+	 * we put the aggregate value in the upper level (A:1).
+	 *
+	 * Note that refreshing runtime_total_sloppy is racy because we do
+	 * not coordinate multiple, concurrent CPUs to consume budget and
+	 * update runtime_total_sloppy intentionally. That is because the
+	 * coordination (e.g., locking) is more expensive than computation,
+	 * especially on the critical path. Furthermore, the slight inaccuracy
+	 * does not harm and will be compensated for over time.
+	 */
+	bpf_rcu_read_lock();
+	subroot_css = &cgrp->self;
+	bpf_for_each(css, pos, subroot_css, BPF_CGROUP_ITER_DESCENDANTS_POST) {
+		/*
+		 * We first obtain the up-to-date value of runtime_total
+		 * of its LLC contexts if they exist.
+		 */
+		cur_cgrp = pos->cgroup;
+		cur_level = cur_cgrp->level;
+		if (cur_level == 0 && can_loop) /* cgroup_root */
+			break;
+		if (cur_level >= CBW_CGRP_TREE_HEIGHT_MAX) {
+			cbw_err("The cgroup tree is too tall");
+			ret = -E2BIG;
+			goto unlock_out;
+		}
+		if (prev_level == -EINVAL)
+			prev_level = cur_level;
+
+		cur_cgx = cbw_get_cgroup_ctx(cur_cgrp);
+		if (!cur_cgx) {
+			cbw_err("Failed to lookup a cgroup ctx");
+			ret = -ESRCH;
+			goto unlock_out;
+		}
+
+		rt_llcx = cbw_sum_rumtime_total_llcx(cur_cgrp, cur_cgx);
+
+		/*
+		 * When traversing the siblings (e.g., D:2 -> E2, A:1 -> B:1,
+		 * B:1 -> C:1), the previous and current levels are the same.
+		 *
+		 * This means the current cgroup does not have children.
+		 * Hence, its runtime_total_sloppy is the sum of runtime_total
+		 * of its LLC contexts (i.e., rt_llcx).
+		 */
+		if (prev_level == cur_level) {
+			WRITE_ONCE(cur_cgx->runtime_total_sloppy, rt_llcx);
+		}
+		/*
+		 * When starting to travel the subtree of a sibling (e.g.,
+		 * B:1 -> F:2), the current level is larger than the previous
+		 * level.
+		 *
+		 * This means the current cgroup does not have children.
+		 * Hence, its runtime_total_sloppy is the sum of runtime_total
+		 * of its LLC contexts (i.e., rt_llcx).
+		 */
+		else if (prev_level < cur_level) {
+			WRITE_ONCE(cur_cgx->runtime_total_sloppy, rt_llcx);
+		}
+		/*
+		 * Once finishing the traversal of all its siblings (e.g.,
+		 * D:2 E:2 -> A1, F:2 G:2 -> C:1), the current level is smaller
+		 * than the previous level.
+		 *
+		 * This means that the current cgroup is a parent of cgroups
+		 * in the previous level. Hence, we should aggregate all
+		 * children's runtime_total_sloppy (i.e., rts_level[prev_level])
+		 * and the sum of runtime_total of its LLC contexts (i.e.,
+		 * rt_llcx).
+		 *
+		 * Since we finished a subtree, we should reset the accumulated
+		 * runtime_total_sloppy value of the previous level (i.e.,
+		 * rts_level[prev_level] = 0).
+		 */
+		else if (prev_level > cur_level) {
+			WRITE_ONCE(cur_cgx->runtime_total_sloppy,
+				   rts_level[prev_level] + rt_llcx);
+			rts_level[prev_level] = 0;
+		}
+
+		/* If the cgroup reached the upper bound, mark it throttled. */
+		if (cur_cgx->runtime_total_sloppy >= cur_cgx->nquota_ub)
+			WRITE_ONCE(cur_cgx->is_throttled, true);
+
+		/* Aggregate this cgroup's runtime_total_sloppy to the level. */
+		rts_level[cur_level] += cur_cgx->runtime_total_sloppy;
+		
+		/* Update the previous level. */
+		prev_level = cur_level;
+
+		/* Increase the number of cgroups processed. */
+		nr_cgrps++;
+	}
+
+	/*
+	 * Aggregate runtime_total_sloppy for @cgrp.
+	 */
+	if (cur_cgx && cur_level > 0) {
+		if (nr_cgrps == 1) {
+			/* @cgrp is at the leaf level (e.g., B:1, D:2). */
+			WRITE_ONCE(cur_cgx->runtime_total_sloppy, rt_llcx);
+		} else {
+			/* @cgrp is at the intermediate level (e.g., A:1). */
+			WRITE_ONCE(cur_cgx->runtime_total_sloppy,
+				   rts_level[prev_level] + rt_llcx);
+		}
+	}
+unlock_out:
+	bpf_rcu_read_unlock();
+	return ret;
+}
+
+static
+s64 cbw_transfer_budget_c2l(struct scx_cgroup_ctx *src_cgx,
+			    struct scx_cgroup_llc_ctx *tgt_llcx)
+{
+	u64 b = cbw_config.budget_c2l;
+	s64 remaining = READ_ONCE(src_cgx->budget_remaining);
+
+	if (remaining <= 0)
+		return remaining;
+
+	/*
+	 * We move the budget from a cgroup level to the LLC level by
+	 * budget_c2l at a time until enough budget is secured at the LLC
+	 * level, or the budget at the cgroup level becomes empty.
+	 */
+	do {
+		__sync_fetch_and_sub(&src_cgx->budget_remaining, b);
+		__sync_fetch_and_add(&tgt_llcx->budget_remaining, b);
+	} while ((tgt_llcx->budget_remaining <= 0) &&
+		 (src_cgx->budget_remaining > 0) && can_loop);
+
+	return tgt_llcx->budget_remaining;
+}
+
+static
+s64 cbw_transfer_budget_p2c(struct scx_cgroup_ctx *src_cgx,
+			    struct scx_cgroup_ctx *tgt_cgx)
+{
+	u64 b = cbw_config.budget_p2c;
+	s64 remaining = READ_ONCE(src_cgx->budget_remaining);
+
+	if (remaining <= 0)
+		return remaining;
+
+	/*
+	 * We move the budget from a subroot cgroup level to the leaf/threaded
+	 * cgroup level by budget_p2c at a time until enough budget is secured
+	 * or the budget at the subroot cgroup level becomes empty.
+	 */
+	do {
+		__sync_fetch_and_sub(&src_cgx->budget_remaining, b);
+		__sync_fetch_and_add(&tgt_cgx->budget_remaining, b);
+	} while ((tgt_cgx->budget_remaining <= 0) &&
+		 (src_cgx->budget_remaining > 0) && can_loop);
+
+	return tgt_cgx->budget_remaining;
+}
+
+static
+s64 cbw_transfer_budget_p2l(struct scx_cgroup_ctx *subroot_cgx,
+			    struct scx_cgroup_ctx *tgt_cgx,
+			    struct scx_cgroup_llc_ctx *tgt_llcx)
+{
+	s64 remaining = READ_ONCE(subroot_cgx->budget_remaining);
+
+	if (remaining <= 0)
+		return remaining;
+
+	/*
+	 * We move the budget from the subroot cgroup to the target cgroup,
+	 * then finally to the target LLC context.
+	 */
+	do {
+		remaining = cbw_transfer_budget_p2c(subroot_cgx, tgt_cgx);
+		if (remaining <= 0) {
+			/*
+			 * If there is no remaining budget in the subroot
+			 * cgroup, we should throttle the cgroup.
+			 */
+			WRITE_ONCE(tgt_cgx->is_throttled, true);
+			break;
+		}
+
+		remaining = cbw_transfer_budget_c2l(tgt_cgx, tgt_llcx);
+	} while((remaining <= 0) && can_loop);
+
+	return remaining;
+}
+
+static
+void cbw_reserve_budget(struct scx_cgroup_llc_ctx *llcx, u64 slice_ns)
+{
+	/*
+	 * If the runtime is infinite, we don't need to decrement
+	 * budget_remaining, which saves cache coherence traffic.
+	 */
+	if (llcx->budget_remaining == CBW_RUNTUME_INF)
+		return;
+
+	__sync_fetch_and_sub(&llcx->budget_remaining, slice_ns);
+}
+
+/**
+ * scx_cgroup_bw_reserve - Reserve a time budget for executing a task.
+ * @cgrp: cgroup where a task belongs to.
+ * @llc_id: caller's LLC id.
+ * @slice_ns: amount of time budgeted.
+ *
+ * Return 0 for success in reserving the time slice,
+ * -EAGAIN when the cgroup is throttled, and
+ * -errno for some other failures.
+ */
 __hidden
 int scx_cgroup_bw_reserve(struct cgroup *cgrp __arg_trusted, int llc_id, u64 slice_ns)
 {
-	return -ENOTSUP;
+	struct scx_cgroup_ctx *cgx, *subroot_cgx;
+	struct scx_cgroup_llc_ctx *llcx;
+	struct cgroup *subroot_cgrp;
+	int ret;
+
+	/* Sanity check LLC ID. */
+	if (!is_llc_id_valid(llc_id)) {
+		cbw_err("Invalid LLC id: %d", llc_id);
+		return -EINVAL;
+	}
+
+	/*
+	 * If the budget remains at the LLC level, let's reserve it and go
+	 * ahead.
+	 *
+	 * Note that we overbook the time on purpose. That is because it is
+	 * better to overbook the cgroup. If underbooked, the cgroup's
+	 * quota won't be fully consumed, and the remaining time won't be
+	 * accumulated. On the other hand, if overbooked, the cgroup's quota
+	 * will be fully utilized, and its debt will be charged over time.
+	 */
+	llcx = cbw_get_llc_ctx(cgrp, llc_id);
+	if (!llcx) {
+		cbw_err("Failed to lookup an LLC ctx");
+		return -ESRCH;
+	}
+
+	if (READ_ONCE(llcx->budget_remaining) > 0) {
+		cbw_reserve_budget(llcx, slice_ns);
+		return 0;
+	}
+
+	/*
+	 * If the budget remains at the cgroup level, transfer the cgroup's
+	 * budget to the LLC level by budget_c2l.
+	 */
+	cgx = cbw_get_cgroup_ctx(cgrp);
+	if (!cgx) {
+		cbw_err("Failed to lookup a cgroup ctx");
+		return -ESRCH;
+	}
+
+	if (cbw_transfer_budget_c2l(cgx, llcx) > 0) {
+		cbw_reserve_budget(llcx, slice_ns);
+		return 0;
+	}
+
+	/*
+	 * There is no budget remaining at the cgroup level. Before asking
+	 * more budget to its subroot cgroup, let's first check whether the
+	 * cgroup is already throttled or not. We check it eagerly first,
+	 * then recheck it after updating its runtime_total_sloppy.
+	 */
+	if (READ_ONCE(cgx->is_throttled))
+		return -EAGAIN;
+
+	cbw_update_runtime_total_sloppy(cgrp);
+
+	if (READ_ONCE(cgx->is_throttled))
+		return -EAGAIN;
+
+	/*
+	 * If this cgroup is a subroot (level == 1), there is nothing to do.
+	 */
+	if (cgrp->level == 1)
+		return -EAGAIN;
+
+	/*
+	 * There is no budget remaining at the cgroup level, and the cgroup is
+	 * not throttled yet. Let's secure budget from the subroot cgroup.
+	 */
+	subroot_cgrp = bpf_cgroup_ancestor(cgrp, 1);
+	if (!subroot_cgrp) {
+		cbw_err("Failed to lookup a subroot cgroup.");
+		return -ESRCH;
+	}
+
+	subroot_cgx = cbw_get_cgroup_ctx(subroot_cgrp);
+	if (!subroot_cgx) {
+		cbw_err("Failed to lookup a cgroup ctx");
+		ret = -ESRCH;
+		goto release_out;
+	}
+
+	if (cbw_transfer_budget_p2l(subroot_cgx, cgx, llcx) > 0) {
+		cbw_reserve_budget(llcx, slice_ns);
+		ret = 0;
+		goto release_out;
+	}
+
+	/*
+	 * Unfortunately, there is not enough budget in the subroot cgroup.
+	 * The cgroup is throttled before reaching the upper bound (nquota_ub).
+	 * This can happen in various cases. For example, this cgroup's
+	 * siblings have already spent too much budget, so there is no
+	 * remaining budget for this cgroup.
+	 */
+	ret = -EAGAIN;
+
+release_out:
+	bpf_cgroup_release(subroot_cgrp);
+	return ret;
 }
 
 __hidden
