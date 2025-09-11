@@ -138,7 +138,7 @@ struct scx_cgroup_llc_ctx {
 static struct scx_cgroup_bw_config cbw_config;
 
 /*
- * A map to store scx_cgroup_ctx. It is accessed through a cgroup pointer. 
+ * A map to store scx_cgroup_ctx. It is accessed through a cgroup pointer.
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_CGRP_STORAGE);
@@ -227,7 +227,8 @@ static u64 div_round_up(u64 dividend, u64 divisor)
 static
 bool is_kernel_compatible(void)
 {
-	return bpf_core_field_exists(struct scx_cgroup_init_args, bw_period_us);
+	// return bpf_core_field_exists(struct scx_cgroup_init_args, bw_period_us);
+	return true;
 }
 
 /**
@@ -516,8 +517,10 @@ int scx_cgroup_bw_init(struct cgroup *cgrp __arg_trusted, struct scx_cgroup_init
 		return -ENOMEM;
 	}
 
-	cbw_set_bandwidth(cgrp, cgx, args->bw_period_us, args->bw_quota_us,
-			  args->bw_burst_us);
+	cbw_set_bandwidth(cgrp, cgx,
+		100000, ~0ULL, 0
+		      // args->bw_period_us, args->bw_quota_us, args->bw_burst_us
+			);
 	cbw_update_nquota_ub(cgrp, cgx);
 	cgx->runtime_total_sloppy = 0;
 	cgx->budget_remaining = (cgrp->level == 1)? cgx->nquota : 0;
@@ -769,7 +772,7 @@ int cbw_update_runtime_total_sloppy(struct cgroup *cgrp __arg_trusted)
 
 		/* Aggregate this cgroup's runtime_total_sloppy to the level. */
 		rts_level[cur_level] += cur_cgx->runtime_total_sloppy;
-		
+
 		/* Update the previous level. */
 		prev_level = cur_level;
 
@@ -887,7 +890,7 @@ void cbw_reserve_budget(struct scx_cgroup_llc_ctx *llcx, u64 slice_ns)
 	__sync_fetch_and_sub(&llcx->budget_remaining, slice_ns);
 }
 
-static 
+static
 void cbw_consume_budget(struct scx_cgroup_llc_ctx *llcx, u64 reserved_ns, u64 consumed_ns)
 {
 	s64 delta_ns;
@@ -1178,7 +1181,7 @@ int cbw_replenish_cgroup(struct scx_cgroup_ctx *cgx, u64 cgrp_id, int level, u64
 				cbw_err("Failed to lookup an LLC context");
 				continue;
 			}
-	
+
 			cbw_drain_btq_until_throttled(cgx, llcx);
 		}
 	}
