@@ -880,6 +880,26 @@ void cbw_reserve_budget(struct scx_cgroup_llc_ctx *llcx, u64 slice_ns)
 	__sync_fetch_and_sub(&llcx->budget_remaining, slice_ns);
 }
 
+static 
+void cbw_consume_budget(struct scx_cgroup_llc_ctx *llcx, u64 reserved_ns, u64 consumed_ns)
+{
+	s64 delta_ns;
+
+	/*
+	 * If the runtime is infinite, we don't need to update runtime_total
+	 * and budget_remaining, which saves cache coherence traffic.
+	 */
+	if (llcx->budget_remaining == CBW_RUNTUME_INF)
+		return;
+
+	/* Compensate for the delta between the plan vs. actual budget use. */
+	delta_ns = (s64)consumed_ns - (s64)reserved_ns;
+	if (delta_ns)
+		__sync_fetch_and_add(&llcx->budget_remaining, delta_ns);
+
+	__sync_fetch_and_add(&llcx->runtime_total, consumed_ns);
+}
+
 /**
  * scx_cgroup_bw_reserve - Reserve a time budget for executing a task.
  * @cgrp: cgroup where a task belongs to.
@@ -997,10 +1017,42 @@ release_out:
 	return ret;
 }
 
+/**
+ * scx_cgroup_bw_consume - Consume the time actually used after the task execution.
+ * @cgrp: cgroup where a task belongs to.
+ * @llc_id: caller's LLC id.
+ * @reserved_ns: amount of time budgeted.
+ * @consumed_ns: amount of time actually used.
+ *
+ * Return 0 for success, -errno for failure.
+ */
 __hidden
 int scx_cgroup_bw_consume(struct cgroup *cgrp __arg_trusted, int llc_id, u64 reserved_ns, u64 consumed_ns)
 {
-	return -ENOTSUP;
+	struct scx_cgroup_llc_ctx *llcx;
+
+	/* Sanity check LLC ID. */
+	if (!is_llc_id_valid(llc_id)) {
+		cbw_err("Invalid LLC id: %d", llc_id);
+		return -EINVAL;
+	}
+
+	/*
+	 * Update the budget usage.
+	 *
+	 * Note that the budget can be reserved in an LLC domain and then
+	 * actually used in another LLC domain. However, that is not a problem
+	 * because LLC's runtime_total will be aggregated to the cgroup level
+	 * at reservation.
+	 */
+	llcx = cbw_get_llc_ctx(cgrp, llc_id);
+	if (!llcx) {
+		cbw_err("Failed to lookup an LLC ctx");
+		return -ESRCH;
+	}
+
+	cbw_consume_budget(llcx, reserved_ns, consumed_ns);
+	return 0;
 }
 
 __hidden

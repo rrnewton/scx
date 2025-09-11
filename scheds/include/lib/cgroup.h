@@ -91,13 +91,13 @@ int scx_cgroup_bw_set(struct cgroup *cgrp __arg_trusted, u64 period_us, u64 quot
 int scx_cgroup_bw_reserve(struct cgroup *cgrp __arg_trusted, int llc_id, u64 slice_ns);
 
 /**
- * scx_cgroup_bw_consume - 
- * @cgrp:
- * @llc_id:
- * @reserved_ns:
- * @consumed_ns:
+ * scx_cgroup_bw_consume - Consume the time actually used after the task execution.
+ * @cgrp: cgroup where a task belongs to.
+ * @llc_id: caller's LLC id.
+ * @reserved_ns: amount of time budgeted.
+ * @consumed_ns: amount of time actually used.
  *
- * Returns
+ * Return 0 for success, -errno for failure.
  */
 int scx_cgroup_bw_consume(struct cgroup *cgrp __arg_trusted, int llc_id, u64 reserved_ns, u64 consumed_ns);
 
