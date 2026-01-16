@@ -8,6 +8,7 @@
 
 #include <scx/common.bpf.h>
 #include <bpf_arena_common.bpf.h>
+#include <lib/ravg.h>
 #include <lib/sdt_task.h>
 #include <lib/atq.h>
 
@@ -86,6 +87,7 @@ enum consts_internal {
 	LAVD_LC_WAKE_INTERVAL_MIN	= LAVD_SLICE_MIN_NS_DFL,
 	LAVD_LC_INH_RECEIVER_SHIFT	= 2, /* 25.0% of receiver's latency criticality */
 	LAVD_LC_INH_GIVER_SHIFT		= 3, /* 12.5 of giver's latency criticality */
+	LAVD_LC_LATENCY_SENSITIVE_THRESH = 880, /* top ~14% most latency-critical tasks */
 
 	LAVD_SYS_STAT_INTERVAL_NS	= (10ULL * NSEC_PER_MSEC),
 	LAVD_SYS_STAT_DECAY_TIMES	= ((2ULL * LAVD_TIME_ONE_SEC) / LAVD_SYS_STAT_INTERVAL_NS),
@@ -181,6 +183,7 @@ struct task_ctx {
 	u64	last_stopping_clk;	/* last time when scheduled out */
 	u64	run_freq;		/* scheduling frequency in a second */
 	u16	lat_cri;		/* final context-aware latency criticality */
+	u16	normalized_lat_cri;	/* lat_cri normalized to [0, 1024] scale */
 	u16	lat_cri_waker;		/* waker's latency criticality */
 	u16	lat_cri_wakee;		/* wakee's latency criticality */
 	u16	perf_cri;		/* performance criticality of a task */
@@ -296,24 +299,14 @@ struct cpu_ctx {
 	volatile u32	avg_util_invr;	/* average of the scaled CPU utilization, which is capacity and frequency invariant. */
 	volatile u32	cur_util_invr;	/* the scaled CPU utilization of the current interval, which is capacity and frequency invariant. */
 	volatile u64	cpu_release_clk; /* when the CPU is taken by higher-priority scheduler class */
+	struct ravg_data avg_stolen_est;	/* Running average of estimated steal/irq utilization of CPU */
+	volatile u32	lat_capacity;	/* Latency capacity: 1024 - avg_stolen_est (available capacity for latency-sensitive work) */
+	volatile u32	cur_stolen_est;	/* Estimated irq/steal utilization of the current interval */
+	volatile u64	stolen_time_est; /* Estimated time stolen by steal/irq time on CPU */
 	volatile u64	idle_total_wall;/* total idle time so far (wall clock time) */
 	volatile u64	idle_start_clk;	/* when the CPU becomes idle */
 	u64		online_clk;	/* when a CPU becomes online */
 	u64		offline_clk;	/* when a CPU becomes offline */
-	/*
-	 * Average of estimated steal/irq utilization of CPU.
-	 * Will be used in the future.
-	 */
-	volatile u32	avg_stolen_time_wall;
-	/*
-	 * Estimated irq/steal utilization of the current interval.
-	 * Will be used in the future.
-	 */
-	volatile u32	cur_stolen_time_wall;
-	 /*
-	  * Estimated time stolen by steal/irq time on CPU
-	  */
-	volatile u64	stolen_time_wall;
 
 	/*
 	 * --- cacheline 3 boundary (192 bytes) ---
@@ -469,6 +462,7 @@ static __always_inline bool use_cpdom_dsq(void)
 
 bool queued_on_cpu(struct cpu_ctx *cpuc);
 u64 get_target_dsq_id(struct task_struct *p, struct cpu_ctx *cpuc);
+u16 normalize_lat_cri(u16 lat_cri);
 
 extern struct bpf_cpumask __kptr *turbo_cpumask; /* CPU mask for turbo CPUs */
 extern struct bpf_cpumask __kptr *big_cpumask; /* CPU mask for big CPUs */
@@ -556,6 +550,8 @@ struct pick_ctx {
 
 s32 find_cpu_in(const struct cpumask *src_mask, struct cpu_ctx *cpuc_cur);
 s32  pick_idle_cpu(struct pick_ctx *ctx, bool *is_idle);
+s32 find_latency_available_cpu(struct task_struct *p, task_ctx *taskc, s32 start_cpu,
+			       struct bpf_cpumask *lat_avail_mask);
 
 bool consume_task(u64 cpu_dsq_id, u64 cpdom_dsq_id);
 
