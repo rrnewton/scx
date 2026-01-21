@@ -156,8 +156,8 @@ pub struct SchedSample {
     pub slice_wall: u64,
     #[stat(desc = "Amount of time actually used by task in a slice")]
     pub slice_used_wall: u64,
-    #[stat(desc = "Latency criticality of this task")]
-    pub lat_cri: u32,
+    #[stat(desc = "Normalized latency criticality of this task [0-1024]")]
+    pub normalized_lat_cri: u16,
     #[stat(desc = "Average latency criticality in a system")]
     pub avg_lat_cri: u32,
     #[stat(desc = "Static priority (20 == nice 0)")]
@@ -180,8 +180,8 @@ pub struct SchedSample {
     pub thr_perf_cri: u32,
     #[stat(desc = "Target performance level of this CPU")]
     pub cpuperf_cur: u32,
-    #[stat(desc = "CPU utilization of this CPU")]
-    pub cpu_util_wall: u64,
+    #[stat(desc = "Latency capacity of this CPU")]
+    pub lat_capacity: u32,
     #[stat(desc = "Invariant CPU utilization of this CPU scaled by CPU capacity and frequency")]
     pub cpu_util_invr: u64,
     #[stat(desc = "Number of active CPUs when core compaction is enabled")]
@@ -208,7 +208,7 @@ impl SchedSample {
             "WKER_COMM",
             "SLC_NS",
             "SLC_USED_NS",
-            "LAT_CRI",
+            "NORM_LC",
             "AVG_LC",
             "ST_PRIO",
             "RERNBL_NS",
@@ -220,8 +220,8 @@ impl SchedSample {
             "PERF_CRI",
             "THR_PC",
             "CPUFREQ",
-            "CPU_UTIL",
-            "CPU_SUTIL",
+            "LAT_CAP",
+            "CPU_INVR",
             "NR_ACT",
             "DSQ_ID",
             "DSQ_LAT_NS",
@@ -248,7 +248,7 @@ impl SchedSample {
             self.waker_comm,
             self.slice_wall,
             self.slice_used_wall,
-            self.lat_cri,
+            self.normalized_lat_cri,
             self.avg_lat_cri,
             self.static_prio,
             self.rerunnable_interval_wall,
@@ -260,7 +260,7 @@ impl SchedSample {
             self.perf_cri,
             self.thr_perf_cri,
             self.cpuperf_cur,
-            self.cpu_util_wall,
+            self.lat_capacity,
             self.cpu_util_invr,
             self.nr_active,
             self.dsq_id,
