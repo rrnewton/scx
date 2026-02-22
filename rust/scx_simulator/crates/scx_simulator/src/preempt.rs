@@ -38,6 +38,7 @@
 //! [`interleave`]: crate::interleave
 
 use std::cell::Cell;
+use std::io::{BufRead, Write};
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::SeqCst};
 use std::sync::Mutex;
@@ -553,6 +554,13 @@ pub fn record_checkpoint(
 /// instances in a simulation run, without threading records through the engine.
 static GLOBAL_PREEMPTION_COLLECTOR: Mutex<Option<Vec<PreemptionRecord>>> = Mutex::new(None);
 
+/// Global monotonic sequence counter for preemption records.
+///
+/// Each `PreemptRing` has its own local sequence counter that resets per
+/// batch. This global counter ensures unique, monotonic ordering across
+/// all rings/batches for the record/replay feature.
+static GLOBAL_PREEMPTION_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// Enable global preemption record collection.
 ///
 /// Call this before running a simulation to start collecting preemption records.
@@ -560,6 +568,7 @@ static GLOBAL_PREEMPTION_COLLECTOR: Mutex<Option<Vec<PreemptionRecord>>> = Mutex
 pub fn enable_preemption_collection() {
     let mut guard = GLOBAL_PREEMPTION_COLLECTOR.lock().unwrap();
     *guard = Some(Vec::new());
+    GLOBAL_PREEMPTION_SEQ.store(0, SeqCst);
 }
 
 /// Disable and drain all collected preemption records.
@@ -577,14 +586,150 @@ pub fn drain_preemption_records() -> Vec<PreemptionRecord> {
 ///
 /// Called from the signal handler after recording to the ring's local store.
 /// This duplicates records to the global collector for test access.
+/// Assigns a globally-unique monotonic sequence number.
 fn maybe_collect_global(record: PreemptionRecord) {
     // Use try_lock to avoid blocking in signal handler.
     // If the lock is contended, we simply drop this record from global collection.
     if let Ok(mut guard) = GLOBAL_PREEMPTION_COLLECTOR.try_lock() {
         if let Some(ref mut records) = *guard {
-            records.push(record);
+            let global_seq = GLOBAL_PREEMPTION_SEQ.fetch_add(1, SeqCst);
+            records.push(PreemptionRecord {
+                sequence: global_seq,
+                ..record
+            });
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Structop tracking — per-structop state for trace output
+// ---------------------------------------------------------------------------
+
+/// Snapshot of structop tracking for trace output.
+///
+/// A "structop" is one invocation of a scheduler ops callback (dispatch,
+/// enqueue, select_cpu, etc.). This tracks per-worker and global call
+/// counts, plus cumulative RBC within the current structop.
+#[derive(Debug, Clone, Copy)]
+pub struct StructopInfo {
+    /// Per-worker structop call count (1-based).
+    pub cpu_count: u64,
+    /// Global structop call count across all workers (1-based).
+    pub global_count: u64,
+    /// Cumulative RBC count within this structop.
+    pub rbc_total: u64,
+    /// Number of kfunc (cooperative) yields within this structop.
+    pub kfunc_count: u64,
+}
+
+thread_local! {
+    static STRUCTOP_CPU_COUNT: Cell<u64> = const { Cell::new(0) };
+    static STRUCTOP_RBC_TOTAL: Cell<u64> = const { Cell::new(0) };
+    static STRUCTOP_KFUNC_COUNT: Cell<u64> = const { Cell::new(0) };
+    static IN_STRUCTOP: Cell<bool> = const { Cell::new(false) };
+}
+static STRUCTOP_GLOBAL_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Begin a new structop: increment per-worker and global counts, reset
+/// per-structop accumulators. Called when entering a new ops callback.
+pub fn begin_structop() {
+    STRUCTOP_CPU_COUNT.with(|c| c.set(c.get() + 1));
+    STRUCTOP_GLOBAL_COUNT.fetch_add(1, SeqCst);
+    STRUCTOP_RBC_TOTAL.with(|c| c.set(0));
+    STRUCTOP_KFUNC_COUNT.with(|c| c.set(0));
+}
+
+/// Read current structop tracking state.
+pub fn structop_info() -> StructopInfo {
+    StructopInfo {
+        cpu_count: STRUCTOP_CPU_COUNT.with(|c| c.get()),
+        global_count: STRUCTOP_GLOBAL_COUNT.load(SeqCst),
+        rbc_total: STRUCTOP_RBC_TOTAL.with(|c| c.get()),
+        kfunc_count: STRUCTOP_KFUNC_COUNT.with(|c| c.get()),
+    }
+}
+
+/// Record RBC consumed by a preemption within the current structop.
+///
+/// Called from the signal handler after preemption to accumulate the
+/// timeslice into the per-structop RBC total.
+pub fn record_rbc_preemption(timeslice: u64) {
+    STRUCTOP_RBC_TOTAL.with(|c| c.set(c.get() + timeslice));
+}
+
+/// Increment the per-structop kfunc yield counter.
+///
+/// Called from `maybe_yield_preemptive()` on each cooperative yield.
+pub fn inc_structop_kfunc() {
+    STRUCTOP_KFUNC_COUNT.with(|c| c.set(c.get() + 1));
+}
+
+/// Reset the per-worker structop count (call when a worker finishes).
+pub fn reset_structop_cpu_count() {
+    STRUCTOP_CPU_COUNT.with(|c| c.set(0));
+    STRUCTOP_RBC_TOTAL.with(|c| c.set(0));
+    STRUCTOP_KFUNC_COUNT.with(|c| c.set(0));
+    IN_STRUCTOP.with(|c| c.set(false));
+}
+
+/// Reset global structop count (call between dispatch rounds).
+pub fn reset_structop_globals() {
+    STRUCTOP_GLOBAL_COUNT.store(0, SeqCst);
+}
+
+/// Detect structop boundary transitions and call `begin_structop()` when
+/// entering a new ops callback.
+///
+/// Matches the frida branch pattern: begin if newly in ops, clear flag
+/// if not in ops.
+pub fn maybe_begin_structop(in_ops: bool) {
+    IN_STRUCTOP.with(|c| {
+        if in_ops && !c.get() {
+            c.set(true);
+            begin_structop();
+        } else if !in_ops {
+            c.set(false);
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// .so base address helper for RIP offset computation
+// ---------------------------------------------------------------------------
+
+/// Get the base address of the scheduler .so in the current process.
+///
+/// Parses `/proc/self/maps` looking for the first executable mapping from
+/// a `libscx_*.so` file. Returns 0 if not found. The result can be
+/// subtracted from an absolute RIP to get a .so-relative offset that
+/// survives ASLR.
+pub fn scheduler_so_base() -> u64 {
+    let maps = match std::fs::read_to_string("/proc/self/maps") {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    for line in maps.lines() {
+        // Executable mapping: look for 'r-xp' or 'r--xp' permission field
+        // and a path containing "libscx_"
+        if !line.contains("libscx_") {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        // Check permissions field for executable
+        if !parts[1].contains('x') {
+            continue;
+        }
+        // Parse start address from "start-end"
+        if let Some(start_str) = parts[0].split('-').next() {
+            if let Ok(addr) = u64::from_str_radix(start_str, 16) {
+                return addr;
+            }
+        }
+    }
+    0
 }
 
 // ---------------------------------------------------------------------------
@@ -947,8 +1092,30 @@ pub fn maybe_yield_preemptive() {
         )
     };
 
+    // Detect structop boundary transitions.
+    let in_ops = saved_ops_ctx != crate::kfuncs::OpsContext::None;
+    maybe_begin_structop(in_ops);
+
+    // Increment per-structop kfunc yield counter.
+    inc_structop_kfunc();
+
+    // Emit structop trace message.
+    let sinfo = structop_info();
+    tracing::trace!(
+        "preempt:hwbp kfunc structop {}:{} kfunc {}",
+        sinfo.cpu_count,
+        sinfo.global_count,
+        sinfo.kfunc_count,
+    );
+
     // Release token and block until re-selected (futex-based).
     ring.inc_cooperative_yield();
+
+    // Record the cooperative yield as a preemption point for record/replay.
+    // The RIP is 0 (kfunc boundary marker) and rbc_count is 0 since this
+    // is a cooperative yield, not a PMU-triggered preemption.
+    ring.record_preemption(0, 0, saved_cpu, ctx.worker_id);
+
     tracing::debug!(
         worker = ctx.worker_id.0,
         cpu = saved_cpu.0,
@@ -1120,6 +1287,17 @@ extern "C" fn preempt_handler(
     // 4. Record the preemption point for determinism verification.
     ring.record_preemption(rbc_count, instruction_pointer, saved_cpu, pctx.worker_id);
 
+    // 4a. Track structop RBC and emit trace message.
+    record_rbc_preemption(rbc_count);
+    let sinfo = structop_info();
+    tracing::trace!(
+        "preempt:hwbp rbc structop {}:{} rbc {} rip 0x{:x}",
+        sinfo.cpu_count,
+        sinfo.global_count,
+        sinfo.rbc_total,
+        instruction_pointer,
+    );
+
     // 5. Yield token (futex-based, signal-safe). Blocks until re-selected.
     ring.inc_signal_preempt(); // atomic, signal-safe
     ring.yield_token(pctx.worker_id);
@@ -1220,6 +1398,151 @@ impl PreemptionTrace {
     /// Number of workers in this trace.
     pub fn num_workers(&self) -> usize {
         self.per_worker.len()
+    }
+
+    /// Serialize the trace to a line-oriented text format.
+    ///
+    /// Format:
+    /// ```text
+    /// # scxsim preemption trace
+    /// # workers: 2
+    /// # total: 47
+    /// seq=0 rbc=142 rip=0x7f3a rip_offset=0xc7c cpu=0 worker=0
+    /// ```
+    ///
+    /// The `so_base` is used to compute `rip_offset` (ASLR-resilient).
+    pub fn serialize(&self, w: &mut impl Write, so_base: u64) -> std::io::Result<()> {
+        let total: usize = self.total_preemptions();
+        writeln!(w, "# scxsim preemption trace")?;
+        writeln!(w, "# workers: {}", self.per_worker.len())?;
+        writeln!(w, "# total: {total}")?;
+
+        // Flatten and sort by sequence for canonical output order.
+        let mut all: Vec<&PreemptionRecord> =
+            self.per_worker.iter().flat_map(|v| v.iter()).collect();
+        all.sort_by_key(|r| r.sequence);
+
+        for rec in all {
+            let rip_offset = if so_base > 0 && rec.instruction_pointer >= so_base {
+                rec.instruction_pointer - so_base
+            } else {
+                rec.instruction_pointer
+            };
+            writeln!(
+                w,
+                "seq={} rbc={} rip=0x{:x} rip_offset=0x{:x} cpu={} worker={}",
+                rec.sequence,
+                rec.rbc_count,
+                rec.instruction_pointer,
+                rip_offset,
+                rec.cpu_id.0,
+                rec.worker_id.0,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Deserialize a trace from the line-oriented text format.
+    ///
+    /// Parses the header to get the worker count, then each `seq=...` line
+    /// into a `PreemptionRecord`. Uses `rip_offset` + `so_base` to
+    /// reconstruct absolute RIPs if the current .so base differs from
+    /// the recording.
+    pub fn deserialize(r: &mut impl BufRead, so_base: u64) -> std::io::Result<Self> {
+        let mut num_workers: usize = 0;
+        let mut records = Vec::new();
+
+        for line in r.lines() {
+            let line = line?;
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if line.starts_with('#') {
+                // Parse header comments.
+                if let Some(rest) = line.strip_prefix("# workers: ") {
+                    num_workers = rest
+                        .trim()
+                        .parse()
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                }
+                continue;
+            }
+            // Parse data line: seq=N rbc=N rip=0xN rip_offset=0xN cpu=N worker=N
+            let rec = parse_preemption_line(line, so_base).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("bad preemption line: {e}: {line}"),
+                )
+            })?;
+            records.push(rec);
+        }
+
+        if num_workers == 0 && !records.is_empty() {
+            // Infer worker count from max worker_id.
+            num_workers = records.iter().map(|r| r.worker_id.0).max().unwrap_or(0) + 1;
+        }
+
+        Ok(Self::from_records(&records, num_workers))
+    }
+}
+
+/// Parse a single preemption trace line into a `PreemptionRecord`.
+///
+/// Uses `rip_offset` to reconstruct the absolute RIP relative to the
+/// current `so_base`. Falls back to the stored `rip` if offset is missing.
+fn parse_preemption_line(line: &str, so_base: u64) -> Result<PreemptionRecord, String> {
+    let mut seq: u64 = 0;
+    let mut rbc: u64 = 0;
+    let mut rip: u64 = 0;
+    let mut rip_offset: Option<u64> = None;
+    let mut cpu: u32 = 0;
+    let mut worker: usize = 0;
+
+    for part in line.split_whitespace() {
+        if let Some(val) = part.strip_prefix("seq=") {
+            seq = val.parse().map_err(|e| format!("seq: {e}"))?;
+        } else if let Some(val) = part.strip_prefix("rbc=") {
+            rbc = val.parse().map_err(|e| format!("rbc: {e}"))?;
+        } else if let Some(val) = part.strip_prefix("rip=") {
+            rip = parse_hex_or_dec(val).map_err(|e| format!("rip: {e}"))?;
+        } else if let Some(val) = part.strip_prefix("rip_offset=") {
+            rip_offset = Some(parse_hex_or_dec(val).map_err(|e| format!("rip_offset: {e}"))?);
+        } else if let Some(val) = part.strip_prefix("cpu=") {
+            cpu = val.parse().map_err(|e| format!("cpu: {e}"))?;
+        } else if let Some(val) = part.strip_prefix("worker=") {
+            worker = val.parse().map_err(|e| format!("worker: {e}"))?;
+        }
+    }
+
+    // Reconstruct absolute RIP: prefer rip_offset + so_base for ASLR resilience.
+    let instruction_pointer = if let Some(offset) = rip_offset {
+        if so_base > 0 {
+            so_base + offset
+        } else {
+            rip // Fallback to stored absolute RIP
+        }
+    } else {
+        rip
+    };
+
+    Ok(PreemptionRecord {
+        sequence: seq,
+        rbc_count: rbc,
+        instruction_pointer,
+        cpu_id: CpuId(cpu),
+        worker_id: WorkerId(worker),
+    })
+}
+
+/// Parse a string as hex (0x prefix) or decimal.
+fn parse_hex_or_dec(s: &str) -> Result<u64, String> {
+    if let Some(hex) = s.strip_prefix("0x") {
+        u64::from_str_radix(hex, 16).map_err(|e| e.to_string())
+    } else if let Some(hex) = s.strip_prefix("0X") {
+        u64::from_str_radix(hex, 16).map_err(|e| e.to_string())
+    } else {
+        s.parse::<u64>().map_err(|e| e.to_string())
     }
 }
 
@@ -1509,6 +1832,17 @@ extern "C" fn replay_bp_handler(
         target.instruction_pointer,
         saved_cpu,
         rctx.worker_id,
+    );
+
+    // 4a. Track structop RBC and emit trace message.
+    record_rbc_preemption(target.rbc_count);
+    let sinfo = structop_info();
+    tracing::trace!(
+        "preempt:hwbp rbc structop {}:{} rbc {} rip 0x{:x}",
+        sinfo.cpu_count,
+        sinfo.global_count,
+        sinfo.rbc_total,
+        target.instruction_pointer,
     );
 
     // 5. Yield token (futex-based, signal-safe).
@@ -1805,5 +2139,176 @@ mod tests {
         assert!(cursor.is_empty());
         assert_eq!(cursor.len(), 0);
         assert!(cursor.current_target().is_none());
+    }
+
+    #[test]
+    fn test_preemption_trace_serialize_roundtrip() {
+        let records = vec![
+            PreemptionRecord {
+                rbc_count: 100,
+                instruction_pointer: 0x7f000010c0,
+                cpu_id: CpuId(0),
+                worker_id: WorkerId(0),
+                sequence: 0,
+            },
+            PreemptionRecord {
+                rbc_count: 200,
+                instruction_pointer: 0x7f000020d0,
+                cpu_id: CpuId(1),
+                worker_id: WorkerId(1),
+                sequence: 1,
+            },
+            PreemptionRecord {
+                rbc_count: 300,
+                instruction_pointer: 0x7f000030e0,
+                cpu_id: CpuId(0),
+                worker_id: WorkerId(0),
+                sequence: 2,
+            },
+        ];
+
+        let trace = PreemptionTrace::from_records(&records, 2);
+        let so_base: u64 = 0x7f00000000;
+
+        // Serialize to buffer.
+        let mut buf = Vec::new();
+        trace.serialize(&mut buf, so_base).unwrap();
+        let text = String::from_utf8(buf.clone()).unwrap();
+
+        // Verify header.
+        assert!(text.contains("# scxsim preemption trace"));
+        assert!(text.contains("# workers: 2"));
+        assert!(text.contains("# total: 3"));
+
+        // Verify rip_offset is present.
+        assert!(text.contains("rip_offset="));
+
+        // Deserialize with same so_base — should get same absolute RIPs.
+        let mut cursor = std::io::Cursor::new(buf);
+        let trace2 = PreemptionTrace::deserialize(&mut cursor, so_base).unwrap();
+        assert_eq!(trace2.num_workers(), 2);
+        assert_eq!(trace2.total_preemptions(), 3);
+
+        let w0 = trace2.worker_trace(WorkerId(0));
+        assert_eq!(w0.len(), 2);
+        assert_eq!(w0[0].rbc_count, 100);
+        assert_eq!(w0[0].instruction_pointer, 0x7f000010c0);
+        assert_eq!(w0[1].rbc_count, 300);
+
+        let w1 = trace2.worker_trace(WorkerId(1));
+        assert_eq!(w1.len(), 1);
+        assert_eq!(w1[0].rbc_count, 200);
+        assert_eq!(w1[0].instruction_pointer, 0x7f000020d0);
+    }
+
+    #[test]
+    fn test_preemption_trace_aslr_resilience() {
+        // Record at one base address, replay at a different one.
+        let records = vec![PreemptionRecord {
+            rbc_count: 42,
+            instruction_pointer: 0x1000_1000, // abs RIP
+            cpu_id: CpuId(0),
+            worker_id: WorkerId(0),
+            sequence: 0,
+        }];
+
+        let trace = PreemptionTrace::from_records(&records, 1);
+        let record_base: u64 = 0x1000_0000;
+
+        // Serialize with record-time base.
+        let mut buf = Vec::new();
+        trace.serialize(&mut buf, record_base).unwrap();
+
+        // Deserialize with a different replay-time base.
+        let replay_base: u64 = 0x2000_0000;
+        let mut cursor = std::io::Cursor::new(buf);
+        let trace2 = PreemptionTrace::deserialize(&mut cursor, replay_base).unwrap();
+
+        let w0 = trace2.worker_trace(WorkerId(0));
+        assert_eq!(w0.len(), 1);
+        // rip_offset = 0x1000_1000 - 0x1000_0000 = 0x1000
+        // new rip = 0x2000_0000 + 0x1000 = 0x2000_1000
+        assert_eq!(w0[0].instruction_pointer, 0x2000_1000);
+    }
+
+    #[test]
+    fn test_structop_tracking() {
+        // Reset state.
+        reset_structop_globals();
+        reset_structop_cpu_count();
+
+        let info = structop_info();
+        assert_eq!(info.cpu_count, 0);
+        assert_eq!(info.global_count, 0);
+        assert_eq!(info.rbc_total, 0);
+        assert_eq!(info.kfunc_count, 0);
+
+        // Begin a structop.
+        begin_structop();
+        let info = structop_info();
+        assert_eq!(info.cpu_count, 1);
+        assert_eq!(info.global_count, 1);
+
+        // Record RBC.
+        record_rbc_preemption(42);
+        let info = structop_info();
+        assert_eq!(info.rbc_total, 42);
+
+        // Increment kfunc count.
+        inc_structop_kfunc();
+        inc_structop_kfunc();
+        let info = structop_info();
+        assert_eq!(info.kfunc_count, 2);
+
+        // Begin another structop (resets rbc/kfunc).
+        begin_structop();
+        let info = structop_info();
+        assert_eq!(info.cpu_count, 2);
+        assert_eq!(info.global_count, 2);
+        assert_eq!(info.rbc_total, 0);
+        assert_eq!(info.kfunc_count, 0);
+
+        // Cleanup.
+        reset_structop_globals();
+        reset_structop_cpu_count();
+    }
+
+    #[test]
+    fn test_maybe_begin_structop() {
+        reset_structop_globals();
+        reset_structop_cpu_count();
+
+        // Not in ops — should not begin.
+        maybe_begin_structop(false);
+        assert_eq!(structop_info().cpu_count, 0);
+
+        // Enter ops — should begin.
+        maybe_begin_structop(true);
+        assert_eq!(structop_info().cpu_count, 1);
+
+        // Still in ops — should NOT begin again.
+        maybe_begin_structop(true);
+        assert_eq!(structop_info().cpu_count, 1);
+
+        // Leave ops.
+        maybe_begin_structop(false);
+        assert_eq!(structop_info().cpu_count, 1);
+
+        // Re-enter — should begin again.
+        maybe_begin_structop(true);
+        assert_eq!(structop_info().cpu_count, 2);
+
+        // Cleanup.
+        reset_structop_globals();
+        reset_structop_cpu_count();
+    }
+
+    #[test]
+    fn test_parse_hex_or_dec() {
+        assert_eq!(super::parse_hex_or_dec("42").unwrap(), 42);
+        assert_eq!(super::parse_hex_or_dec("0x2a").unwrap(), 42);
+        assert_eq!(super::parse_hex_or_dec("0X2A").unwrap(), 42);
+        assert_eq!(super::parse_hex_or_dec("0xff").unwrap(), 255);
+        assert!(super::parse_hex_or_dec("not_a_number").is_err());
     }
 }

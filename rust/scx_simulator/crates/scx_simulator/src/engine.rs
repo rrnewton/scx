@@ -2894,6 +2894,7 @@ impl<S: Scheduler> Simulator<S> {
             "preemptive interleave: starting dispatch"
         );
         preempt::install_signal_handler();
+        preempt::reset_structop_globals();
 
         std::thread::scope(|s| {
             let ring_ref = &ring;
@@ -2989,6 +2990,7 @@ impl<S: Scheduler> Simulator<S> {
                         let _ = t.disable();
                     }
 
+                    preempt::reset_structop_cpu_count();
                     ring_ref.finish(worker_id);
                     kfuncs::exit_sim();
                     preempt::uninstall();
@@ -3038,6 +3040,7 @@ impl<S: Scheduler> Simulator<S> {
             "replay interleave: starting dispatch"
         );
         preempt::install_replay_signal_handlers();
+        preempt::reset_structop_globals();
 
         // Build per-worker cursors from the trace.
         let cursors: Vec<ReplayCursor> = (0..dispatch_cpus.len())
@@ -3159,6 +3162,7 @@ impl<S: Scheduler> Simulator<S> {
                         }
                     }
 
+                    preempt::reset_structop_cpu_count();
                     ring_ref.finish(worker_id);
                     kfuncs::exit_sim();
                     preempt::uninstall_replay();

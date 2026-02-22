@@ -7,8 +7,8 @@ use clap::{Parser, ValueEnum};
 use scx_simulator::scenario::{parse_duration_ns, parse_seed};
 use scx_simulator::{
     compare_checkpoints, discover_schedulers, drain_determinism_checkpoints,
-    enable_determinism_mode, load_rtapp, DynamicScheduler, PreemptiveConfig, SimFormat, Simulator,
-    SIM_LOCK,
+    drain_preemption_records, enable_determinism_mode, enable_preemption_collection, load_rtapp,
+    DynamicScheduler, PreemptionTrace, PreemptiveConfig, SimFormat, Simulator, SIM_LOCK,
 };
 
 mod real_run;
@@ -168,6 +168,22 @@ struct Cli {
     /// is violated.
     #[arg(long)]
     determinism_check: bool,
+
+    /// Record preemption points to a file (PMU mode).
+    ///
+    /// After the simulation completes, writes the preemption trace to
+    /// the specified file in a text format that can be replayed with
+    /// --replay-preemptions. Requires --preemptive.
+    #[arg(long, value_name = "PATH", requires = "preemptive")]
+    record_preemptions: Option<PathBuf>,
+
+    /// Replay preemption points from a file (hw breakpoint mode).
+    ///
+    /// Reads a preemption trace from a file written by --record-preemptions
+    /// and replays the same preemption points using hardware breakpoints
+    /// for deterministic reproduction. Implies --preemptive.
+    #[arg(long, value_name = "PATH")]
+    replay_preemptions: Option<PathBuf>,
 }
 
 fn main() {
@@ -220,6 +236,30 @@ fn run(cli: &Cli) -> Result<(), String> {
             timeslice_max: cli.timeslice_max,
             cooperative_only: false,
         });
+        scenario.interleave = true;
+    }
+    // Handle --replay-preemptions: load trace and set replay mode.
+    // This implies --preemptive if not already set.
+    if let Some(ref replay_path) = cli.replay_preemptions {
+        let so_base = scx_simulator::preempt::scheduler_so_base();
+        let file = std::fs::File::open(replay_path)
+            .map_err(|e| format!("failed to open {}: {e}", replay_path.display()))?;
+        let mut reader = std::io::BufReader::new(file);
+        let trace = PreemptionTrace::deserialize(&mut reader, so_base)
+            .map_err(|e| format!("failed to parse preemption trace: {e}"))?;
+        eprintln!(
+            "Loaded preemption trace: {} workers, {} preemptions",
+            trace.num_workers(),
+            trace.total_preemptions(),
+        );
+        scenario.replay_trace = Some(trace);
+        if scenario.preemptive.is_none() {
+            scenario.preemptive = Some(PreemptiveConfig {
+                timeslice_min: cli.timeslice_min,
+                timeslice_max: cli.timeslice_max,
+                cooperative_only: false,
+            });
+        }
         scenario.interleave = true;
     }
     if let Some(ref end_time) = cli.end_time {
@@ -381,6 +421,12 @@ fn print_determinism_failure(
 fn run_simulation(cli: &Cli, scenario: scx_simulator::Scenario) -> Result<(), String> {
     let sched = load_scheduler(&cli.scheduler, cli.cpus)?;
     let _lock = SIM_LOCK.lock().unwrap();
+
+    // Enable preemption recording if requested.
+    if cli.record_preemptions.is_some() {
+        enable_preemption_collection();
+    }
+
     let trace = Simulator::new(sched).run(scenario);
 
     if cli.dump_trace {
@@ -394,6 +440,28 @@ fn run_simulation(cli: &Cli, scenario: scx_simulator::Scenario) -> Result<(), St
             .write_perfetto_json(&mut file)
             .map_err(|e| format!("failed to write perfetto trace: {e}"))?;
         eprintln!("wrote perfetto trace to {}", path.display());
+    }
+
+    // Write preemption recording if requested.
+    if let Some(ref record_path) = cli.record_preemptions {
+        let records = drain_preemption_records();
+        let num_workers = if records.is_empty() {
+            0
+        } else {
+            records.iter().map(|r| r.worker_id.0).max().unwrap_or(0) + 1
+        };
+        let preempt_trace = PreemptionTrace::from_records(&records, num_workers);
+        let so_base = scx_simulator::preempt::scheduler_so_base();
+        let mut file = std::fs::File::create(record_path)
+            .map_err(|e| format!("failed to create {}: {e}", record_path.display()))?;
+        preempt_trace
+            .serialize(&mut file, so_base)
+            .map_err(|e| format!("failed to write preemption trace: {e}"))?;
+        eprintln!(
+            "wrote preemption trace ({} preemptions) to {}",
+            preempt_trace.total_preemptions(),
+            record_path.display(),
+        );
     }
 
     if trace.has_error() {
