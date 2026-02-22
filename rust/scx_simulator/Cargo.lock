@@ -646,6 +646,7 @@ dependencies = [
  "libbpf-sys",
  "libc",
  "libloading",
+ "perf-event-open-sys",
  "rand",
  "scx_perf",
  "serde_json",

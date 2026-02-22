@@ -70,7 +70,8 @@ pub use preempt::{
     compare_checkpoints, drain_determinism_checkpoints, drain_preemption_records,
     enable_determinism_mode, enable_preemption_collection, fnv1a_combine, fnv1a_hash_bytes,
     fnv1a_hash_u64, is_determinism_mode_enabled, record_checkpoint, CheckpointDivergence,
-    CheckpointEvent, DeterminismCheckpoint, DivergenceType, PreemptionRecord,
+    CheckpointEvent, DeterminismCheckpoint, DivergenceType, PreemptionRecord, PreemptionTrace,
+    ReplayCursor,
 };
 pub use rtapp::load_rtapp;
 pub use scenario::{
