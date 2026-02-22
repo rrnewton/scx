@@ -57,6 +57,15 @@ impl fmt::Display for PerfError {
     }
 }
 
+/// A PMU hardware event type.
+#[derive(Debug, Clone, Copy)]
+pub enum PmuEvent {
+    /// Retired conditional branches (vendor-specific raw event).
+    RetiredBranchConditional,
+    /// Hardware instructions retired (PERF_TYPE_HARDWARE + PERF_COUNT_HW_INSTRUCTIONS).
+    InstructionsRetired,
+}
+
 /// PMU configuration for retired conditional branches.
 ///
 /// Holds the raw `perf_event_attr.config` value detected via CPUID.
@@ -123,6 +132,65 @@ impl PmuConfig {
 
         Some(PmuConfig { rcb_event })
     }
+
+    /// Resolve a PMU event to `(perf_event_attr.type_, perf_event_attr.config)`.
+    pub fn resolve(&self, event: PmuEvent) -> (u32, u64) {
+        match event {
+            PmuEvent::RetiredBranchConditional => (perf::bindings::PERF_TYPE_RAW, self.rcb_event),
+            PmuEvent::InstructionsRetired => (
+                perf::bindings::PERF_TYPE_HARDWARE,
+                perf::bindings::PERF_COUNT_HW_INSTRUCTIONS as u64,
+            ),
+        }
+    }
+}
+
+/// Open a perf_event_open counting fd for the given type/config pair.
+///
+/// Returns the raw fd. The counter starts disabled, excludes kernel and hypervisor.
+fn open_counting_fd(type_: u32, config: u64) -> Result<RawFd, PerfError> {
+    let mut attr = perf::bindings::perf_event_attr {
+        type_,
+        size: std::mem::size_of::<perf::bindings::perf_event_attr>() as u32,
+        config,
+        ..Default::default()
+    };
+    attr.set_disabled(1);
+    attr.set_exclude_kernel(1);
+    attr.set_exclude_hv(1);
+
+    // pid=0 (current thread), cpu=-1 (any CPU)
+    let fd = unsafe { perf::perf_event_open(&mut attr, 0, -1, -1, 0) };
+    if fd < 0 {
+        return Err(PerfError::Open(io::Error::last_os_error()));
+    }
+    Ok(fd)
+}
+
+/// Open a perf_event_open sampling fd for the given type/config/period.
+///
+/// Returns the raw fd. The counter starts disabled, pinned, excludes kernel
+/// and hypervisor, and generates a wakeup after one sample event.
+fn open_sampling_fd(type_: u32, config: u64, sample_period: u64) -> Result<RawFd, PerfError> {
+    let mut attr = perf::bindings::perf_event_attr {
+        type_,
+        size: std::mem::size_of::<perf::bindings::perf_event_attr>() as u32,
+        config,
+        ..Default::default()
+    };
+    attr.__bindgen_anon_1.sample_period = sample_period;
+    attr.set_disabled(1);
+    attr.set_exclude_kernel(1);
+    attr.set_exclude_hv(1);
+    attr.set_pinned(1);
+    // Generate a wakeup (overflow notification) after one sample event.
+    attr.__bindgen_anon_2.wakeup_events = 1;
+
+    let fd = unsafe { perf::perf_event_open(&mut attr, 0, -1, -1, 0) };
+    if fd < 0 {
+        return Err(PerfError::Open(io::Error::last_os_error()));
+    }
+    Ok(fd)
 }
 
 /// A PMU counter for retired conditional branches.
@@ -138,22 +206,15 @@ impl RbcCounter {
     ///
     /// The counter starts disabled; call [`enable`](Self::enable) to start counting.
     pub fn new(config: &PmuConfig) -> Result<Self, PerfError> {
-        let mut attr = perf::bindings::perf_event_attr {
-            type_: perf::bindings::PERF_TYPE_RAW,
-            size: std::mem::size_of::<perf::bindings::perf_event_attr>() as u32,
-            config: config.rcb_event,
-            ..Default::default()
-        };
-        attr.set_disabled(1);
-        attr.set_exclude_kernel(1);
-        attr.set_exclude_hv(1);
+        Self::new_event(config, PmuEvent::RetiredBranchConditional)
+    }
 
-        // pid=0 (current thread), cpu=-1 (any CPU)
-        let fd = unsafe { perf::perf_event_open(&mut attr, 0, -1, -1, 0) };
-        if fd < 0 {
-            return Err(PerfError::Open(io::Error::last_os_error()));
-        }
-
+    /// Open a counter for an arbitrary PMU event.
+    ///
+    /// The counter starts disabled; call [`enable`](Self::enable) to start counting.
+    pub fn new_event(config: &PmuConfig, event: PmuEvent) -> Result<Self, PerfError> {
+        let (type_, cfg) = config.resolve(event);
+        let fd = open_counting_fd(type_, cfg)?;
         Ok(RbcCounter { fd })
     }
 
@@ -224,25 +285,23 @@ impl RbcTimer {
     /// timer without immediate overflow, then set the real period later with
     /// [`set_period`](Self::set_period).
     pub fn new(config: &PmuConfig, sample_period: u64) -> Result<Self, PerfError> {
-        let mut attr = perf::bindings::perf_event_attr {
-            type_: perf::bindings::PERF_TYPE_RAW,
-            size: std::mem::size_of::<perf::bindings::perf_event_attr>() as u32,
-            config: config.rcb_event,
-            ..Default::default()
-        };
-        attr.__bindgen_anon_1.sample_period = sample_period;
-        attr.set_disabled(1);
-        attr.set_exclude_kernel(1);
-        attr.set_exclude_hv(1);
-        attr.set_pinned(1);
-        // Generate a wakeup (overflow notification) after one sample event.
-        attr.__bindgen_anon_2.wakeup_events = 1;
+        Self::new_event(config, PmuEvent::RetiredBranchConditional, sample_period)
+    }
 
-        let fd = unsafe { perf::perf_event_open(&mut attr, 0, -1, -1, 0) };
-        if fd < 0 {
-            return Err(PerfError::Open(io::Error::last_os_error()));
-        }
-
+    /// Open a timer for an arbitrary PMU event.
+    ///
+    /// The timer starts disabled. The `sample_period` controls how many events
+    /// must occur before an overflow notification fires.
+    /// Use [`DISABLE_SAMPLE_PERIOD`](Self::DISABLE_SAMPLE_PERIOD) to create a
+    /// timer without immediate overflow, then set the real period later with
+    /// [`set_period`](Self::set_period).
+    pub fn new_event(
+        config: &PmuConfig,
+        event: PmuEvent,
+        sample_period: u64,
+    ) -> Result<Self, PerfError> {
+        let (type_, cfg) = config.resolve(event);
+        let fd = open_sampling_fd(type_, cfg, sample_period)?;
         Ok(RbcTimer { fd })
     }
 
@@ -510,7 +569,7 @@ mod tests {
 
         // Install SIGSTKFLT handler.
         let sa = libc::sigaction {
-            sa_sigaction: handler as libc::sighandler_t,
+            sa_sigaction: handler as *const () as libc::sighandler_t,
             sa_mask: unsafe { std::mem::zeroed() },
             sa_flags: libc::SA_SIGINFO,
             sa_restorer: None,
