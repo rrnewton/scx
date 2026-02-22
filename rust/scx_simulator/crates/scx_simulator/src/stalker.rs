@@ -72,6 +72,10 @@ thread_local! {
     /// counter reaches zero. Checked and cleared by `maybe_yield_preemptive()`
     /// at kfunc boundaries.
     static YIELD_PENDING: Cell<bool> = const { Cell::new(false) };
+
+    /// Address of the Jcc instruction that triggered the deferred yield.
+    /// Captured in the callout and returned by `take_yield_pending()`.
+    static YIELD_RIP: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Global counter for total callouts executed (for diagnostics).
@@ -257,8 +261,9 @@ pub fn build_transformer<'a>(gum: &'a Gum, range: &TextRange) -> Transformer<'a>
             if addr >= range_base && addr < range_base + range_size {
                 let bytes = instr.instr().bytes();
                 if is_conditional_branch_opcode(bytes) {
-                    instr.put_callout(|_cpu_context| {
-                        software_rbc_callout_inner();
+                    let orig_addr = addr as u64;
+                    instr.put_callout(move |_cpu_context| {
+                        software_rbc_callout_inner(orig_addr);
                     });
                 }
             }
@@ -279,11 +284,10 @@ pub fn build_transformer<'a>(gum: &'a Gum, range: &TextRange) -> Transformer<'a>
 /// no heap allocation, no stdio, no tracing.
 ///
 /// When the counter decrements to zero (1→0 transition), sets `YIELD_PENDING`
-/// so the next kfunc-boundary yield point will perform the actual yield.
-/// This is one callout earlier than waiting for counter==0, ensuring the flag
-/// is visible at the next kfunc boundary.
+/// and records the instruction address in `YIELD_RIP` so the next
+/// kfunc-boundary yield point will perform the actual yield.
 #[inline]
-fn software_rbc_callout_inner() {
+fn software_rbc_callout_inner(orig_addr: u64) {
     TOTAL_CALLOUTS.fetch_add(1, Relaxed);
 
     SOFTWARE_RBC_COUNTER.with(|counter| {
@@ -297,6 +301,7 @@ fn software_rbc_callout_inner() {
         if new == 0 {
             // Counter just hit zero — signal deferred yield.
             YIELD_PENDING.with(|flag| flag.set(true));
+            YIELD_RIP.with(|rip| rip.set(orig_addr));
         }
     });
 }
@@ -308,20 +313,22 @@ fn software_rbc_callout_inner() {
 /// Check and clear the deferred yield flag.
 ///
 /// Called by [`maybe_yield_preemptive`](crate::preempt::maybe_yield_preemptive)
-/// at kfunc boundaries. Returns `true` if the Stalker callout set the
-/// `YIELD_PENDING` flag (i.e., the software RBC counter expired).
+/// at kfunc boundaries. Returns `Some(rip)` if the Stalker callout set the
+/// `YIELD_PENDING` flag (i.e., the software RBC counter expired), where `rip`
+/// is the original instruction address of the Jcc that triggered the yield.
 ///
-/// When this returns `true`, the caller should perform a preemptive yield
+/// When this returns `Some`, the caller should perform a preemptive yield
 /// (same as a PMU signal-triggered preemption) and then re-arm the counter
 /// via [`rearm_software_rbc`].
-pub fn take_yield_pending() -> bool {
+pub fn take_yield_pending() -> Option<u64> {
     YIELD_PENDING.with(|flag| {
         if flag.get() {
             flag.set(false);
             DEFERRED_YIELDS.fetch_add(1, Relaxed);
-            true
+            let rip = YIELD_RIP.with(|r| r.get());
+            Some(rip)
         } else {
-            false
+            None
         }
     })
 }
@@ -536,26 +543,27 @@ mod tests {
         SOFTWARE_RBC_COUNTER.with(|c| c.set(2));
 
         // 2 → 1: no flag yet.
-        software_rbc_callout_inner();
+        software_rbc_callout_inner(0xdead);
         assert_eq!(SOFTWARE_RBC_COUNTER.with(|c| c.get()), 1);
         assert!(!YIELD_PENDING.with(|f| f.get()));
 
         // 1 → 0: YIELD_PENDING set.
-        software_rbc_callout_inner();
+        software_rbc_callout_inner(0xbeef);
         assert_eq!(SOFTWARE_RBC_COUNTER.with(|c| c.get()), 0);
         assert!(YIELD_PENDING.with(|f| f.get()));
+        assert_eq!(YIELD_RIP.with(|r| r.get()), 0xbeef);
 
         // Counter == 0: already signaled, no-op.
-        software_rbc_callout_inner();
+        software_rbc_callout_inner(0xcafe);
         assert_eq!(SOFTWARE_RBC_COUNTER.with(|c| c.get()), 0);
         assert!(YIELD_PENDING.with(|f| f.get()));
 
-        // take_yield_pending clears the flag.
-        assert!(take_yield_pending());
+        // take_yield_pending clears the flag and returns the RIP.
+        assert_eq!(take_yield_pending(), Some(0xbeef));
         assert!(!YIELD_PENDING.with(|f| f.get()));
 
-        // Second call returns false.
-        assert!(!take_yield_pending());
+        // Second call returns None.
+        assert_eq!(take_yield_pending(), None);
 
         disarm_software_rbc();
     }
@@ -563,7 +571,7 @@ mod tests {
     #[test]
     fn test_callout_disarmed_noop() {
         disarm_software_rbc();
-        software_rbc_callout_inner();
+        software_rbc_callout_inner(0x1234);
         assert_eq!(SOFTWARE_RBC_COUNTER.with(|c| c.get()), u64::MAX);
         assert!(!YIELD_PENDING.with(|f| f.get()));
     }

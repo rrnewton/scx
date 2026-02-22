@@ -920,49 +920,52 @@ pub fn maybe_yield_preemptive() {
 
     // Check for deferred Frida Stalker preemption.
     #[cfg(feature = "frida")]
-    if crate::stalker::is_frida_active() && crate::stalker::take_yield_pending() {
-        // Deferred preemption: the Stalker callout set YIELD_PENDING because
-        // the software RBC counter expired. Perform the actual yield here.
-        let sim_ptr: *mut SimulatorState =
-            crate::kfuncs::sim_state_ptr().expect("frida deferred yield outside simulator context");
+    if crate::stalker::is_frida_active() {
+        if let Some(yield_rip) = crate::stalker::take_yield_pending() {
+            // Deferred preemption: the Stalker callout set YIELD_PENDING because
+            // the software RBC counter expired. Perform the actual yield here.
+            let sim_ptr: *mut SimulatorState = crate::kfuncs::sim_state_ptr()
+                .expect("frida deferred yield outside simulator context");
 
-        let (saved_cpu, saved_ops_ctx, saved_waker) = unsafe {
-            (
-                (*sim_ptr).current_cpu,
-                (*sim_ptr).ops_context,
-                (*sim_ptr).waker_task_raw,
-            )
-        };
+            let (saved_cpu, saved_ops_ctx, saved_waker) = unsafe {
+                (
+                    (*sim_ptr).current_cpu,
+                    (*sim_ptr).ops_context,
+                    (*sim_ptr).waker_task_raw,
+                )
+            };
 
-        // Record the preemption for determinism verification.
-        ring.record_preemption(0, 0, saved_cpu);
+            // Record the preemption for determinism verification.
+            ring.record_preemption(yield_rip, 0, saved_cpu);
 
-        ring.inc_signal_preempt();
-        tracing::trace!(
-            worker = ctx.worker_id.0,
-            cpu = saved_cpu.0,
-            "preempt: frida software RBC yield (deferred to kfunc boundary)"
-        );
-        ring.yield_token(ctx.worker_id);
+            ring.inc_signal_preempt();
+            tracing::trace!(
+                worker = ctx.worker_id.0,
+                cpu = saved_cpu.0,
+                rip = format_args!("0x{yield_rip:x}"),
+                "preempt: frida software RBC yield (deferred to kfunc boundary)"
+            );
+            ring.yield_token(ctx.worker_id);
 
-        // Resumed — restore SimulatorState context.
-        tracing::trace!(
-            worker = ctx.worker_id.0,
-            cpu = saved_cpu.0,
-            "preempt: resumed after frida yield"
-        );
-        unsafe {
-            (*sim_ptr).current_cpu = saved_cpu;
-            (*sim_ptr).ops_context = saved_ops_ctx;
-            (*sim_ptr).waker_task_raw = saved_waker;
+            // Resumed — restore SimulatorState context.
+            tracing::trace!(
+                worker = ctx.worker_id.0,
+                cpu = saved_cpu.0,
+                "preempt: resumed after frida yield"
+            );
+            unsafe {
+                (*sim_ptr).current_cpu = saved_cpu;
+                (*sim_ptr).ops_context = saved_ops_ctx;
+                (*sim_ptr).waker_task_raw = saved_waker;
+            }
+
+            // Re-arm the software counter with a fresh timeslice.
+            let timeslice = ring.roll_timeslice(ctx.timeslice_min, ctx.timeslice_max);
+            crate::stalker::rearm_software_rbc(timeslice);
+
+            // Don't also do cooperative yield — we already yielded.
+            return;
         }
-
-        // Re-arm the software counter with a fresh timeslice.
-        let timeslice = ring.roll_timeslice(ctx.timeslice_min, ctx.timeslice_max);
-        crate::stalker::rearm_software_rbc(timeslice);
-
-        // Don't also do cooperative yield — we already yielded.
-        return;
     }
 
     // Disable the PMU timer during the cooperative yield to prevent
