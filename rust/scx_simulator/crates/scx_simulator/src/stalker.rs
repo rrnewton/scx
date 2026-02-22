@@ -76,6 +76,13 @@ thread_local! {
     /// Address of the Jcc instruction that triggered the deferred yield.
     /// Captured in the callout and returned by `take_yield_pending()`.
     static YIELD_RIP: Cell<u64> = const { Cell::new(0) };
+
+    /// Base address of the scheduler `.so`'s executable segment.
+    ///
+    /// Set by [`arm_software_rbc`] so that [`rip_to_offset`] can convert
+    /// absolute RIPs to `.so`-relative offsets for ASLR-resilient
+    /// determinism comparisons.
+    static TEXT_BASE: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Global counter for total callouts executed (for diagnostics).
@@ -351,13 +358,20 @@ pub fn rearm_software_rbc(timeslice: u64) {
 // Arm / disarm / query
 // ---------------------------------------------------------------------------
 
-/// Arm the software RBC counter with the given timeslice.
-pub fn arm_software_rbc(timeslice: u64) {
+/// Arm the software RBC counter with the given timeslice and `.so` text base.
+///
+/// The `text_base` is the base address of the scheduler `.so`'s executable
+/// segment. It is used by [`rip_to_offset`] to convert absolute RIPs to
+/// `.so`-relative offsets for ASLR-resilient determinism comparisons.
+pub fn arm_software_rbc(timeslice: u64, text_base: u64) {
     SOFTWARE_RBC_COUNTER.with(|counter| {
         counter.set(timeslice);
     });
     FRIDA_ACTIVE.with(|active| {
         active.set(true);
+    });
+    TEXT_BASE.with(|base| {
+        base.set(text_base);
     });
 }
 
@@ -372,11 +386,37 @@ pub fn disarm_software_rbc() {
     YIELD_PENDING.with(|flag| {
         flag.set(false);
     });
+    TEXT_BASE.with(|base| {
+        base.set(0);
+    });
 }
 
 /// Check whether Frida Stalker instrumentation is active on the current thread.
 pub fn is_frida_active() -> bool {
     FRIDA_ACTIVE.with(|active| active.get())
+}
+
+/// Convert an absolute RIP to a `.so`-relative offset.
+///
+/// Subtracts the `.so` text segment base address (set by [`arm_software_rbc`])
+/// from the absolute address. Returns 0 if the text base is not set (disarmed)
+/// or if `rip` is below the base (shouldn't happen for instrumented code).
+///
+/// This makes RIP values ASLR-resilient: the `.so` loads at different virtual
+/// addresses in each run, but the offset within the `.so` is constant.
+pub fn rip_to_offset(rip: u64) -> u64 {
+    let base = TEXT_BASE.with(|b| b.get());
+    if base == 0 || rip < base {
+        return rip; // Fallback: return raw address if base unknown
+    }
+    rip - base
+}
+
+/// Return the `.so` text segment base address for the current thread.
+///
+/// Returns 0 if Frida is not armed on this thread.
+pub fn text_base() -> u64 {
+    TEXT_BASE.with(|b| b.get())
 }
 
 /// Return the total number of callouts executed (diagnostic counter).
@@ -528,14 +568,16 @@ mod tests {
 
     #[test]
     fn test_arm_disarm_software_rbc() {
-        arm_software_rbc(42);
+        arm_software_rbc(42, 0x7f0000000000);
         assert!(is_frida_active());
         assert_eq!(SOFTWARE_RBC_COUNTER.with(|c| c.get()), 42);
+        assert_eq!(text_base(), 0x7f0000000000);
 
         disarm_software_rbc();
         assert!(!is_frida_active());
         assert_eq!(SOFTWARE_RBC_COUNTER.with(|c| c.get()), u64::MAX);
         assert!(!YIELD_PENDING.with(|f| f.get()));
+        assert_eq!(text_base(), 0);
     }
 
     #[test]
@@ -574,5 +616,17 @@ mod tests {
         software_rbc_callout_inner(0x1234);
         assert_eq!(SOFTWARE_RBC_COUNTER.with(|c| c.get()), u64::MAX);
         assert!(!YIELD_PENDING.with(|f| f.get()));
+    }
+
+    #[test]
+    fn test_rip_to_offset() {
+        // With text base set, returns offset
+        arm_software_rbc(100, 0x7f0000001000);
+        assert_eq!(rip_to_offset(0x7f0000001500), 0x500);
+        assert_eq!(rip_to_offset(0x7f0000001000), 0);
+
+        // With base=0 (disarmed), returns raw address
+        disarm_software_rbc();
+        assert_eq!(rip_to_offset(0x7f0000001500), 0x7f0000001500);
     }
 }

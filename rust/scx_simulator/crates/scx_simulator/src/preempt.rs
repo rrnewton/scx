@@ -935,14 +935,34 @@ pub fn maybe_yield_preemptive() {
                 )
             };
 
+            // Convert absolute RIP to .so-relative offset for ASLR resilience.
+            // The .so loads at different addresses in each run, but the offset
+            // within the .so is constant.
+            let rip_offset = crate::stalker::rip_to_offset(yield_rip);
+
             // Record the preemption for determinism verification.
-            ring.record_preemption(yield_rip, 0, saved_cpu);
+            // Arguments: rbc_count=0 (counter expired), instruction_pointer=rip_offset.
+            ring.record_preemption(0, rip_offset, saved_cpu);
+
+            // Record a Preemption checkpoint in the determinism system so that
+            // determinism-check compares preemption points across runs.
+            if is_determinism_mode_enabled() {
+                let memory_hash = unsafe { (*sim_ptr).compute_state_hash() };
+                record_checkpoint(
+                    CheckpointEvent::Preemption,
+                    rip_offset,
+                    0,
+                    memory_hash,
+                    saved_cpu,
+                );
+            }
 
             ring.inc_signal_preempt();
             tracing::trace!(
                 worker = ctx.worker_id.0,
                 cpu = saved_cpu.0,
                 rip = format_args!("0x{yield_rip:x}"),
+                rip_offset = format_args!("0x{rip_offset:x}"),
                 "preempt: frida software RBC yield (deferred to kfunc boundary)"
             );
             ring.yield_token(ctx.worker_id);

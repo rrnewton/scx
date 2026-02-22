@@ -3050,7 +3050,7 @@ impl<S: Scheduler> Simulator<S> {
                     // Arm software RBC and start Stalker before entering
                     // scheduler C code.
                     let ts = ring_ref.roll_timeslice(timeslice_min, timeslice_max);
-                    stalker::arm_software_rbc(ts);
+                    stalker::arm_software_rbc(ts, text_range.base as u64);
                     stalker_inst
                         .follow_me::<frida_gum::stalker::NoneEventSink>(&transformer_ref.0, None);
 
@@ -3537,7 +3537,7 @@ impl<S: Scheduler> Simulator<S> {
 
                     // Arm software RBC and start Stalker before processing.
                     let ts = ring_ref.roll_timeslice(timeslice_min, timeslice_max);
-                    stalker::arm_software_rbc(ts);
+                    stalker::arm_software_rbc(ts, text_range.base as u64);
                     stalker_inst
                         .follow_me::<frida_gum::stalker::NoneEventSink>(&transformer_ref.0, None);
 
