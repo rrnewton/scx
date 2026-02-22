@@ -660,6 +660,10 @@ pub fn set_sim_cpu_width(nr_cpus: u32) {
 /// and resumes it on return. Adds `cost_ns` to the accumulated kfunc
 /// cost for the current measurement window.
 ///
+/// After resuming timers, performs a post-kfunc cooperative yield to
+/// give other workers a chance to run between consecutive kfuncs.
+/// This doubles interleaving coverage compared to pre-kfunc-only yields.
+///
 /// # Panics
 /// Panics if called outside of an `enter_sim`/`exit_sim` scope.
 fn with_sim<F, R>(cost_ns: u64, f: F) -> R
@@ -670,27 +674,43 @@ where
         let ptr = cell
             .get()
             .expect("kfunc called outside of simulator context");
-        // SAFETY: We hold a valid pointer installed by enter_sim, and
-        // the simulation is single-threaded.
-        let sim = unsafe { &mut *ptr };
-        // Track kfunc call count and cost for RBC accounting
-        sim.rbc_kfunc_calls += 1;
-        sim.rbc_kfunc_ns += cost_ns;
-        // Pause RBC counter — kfunc code is not scheduler code
-        if let Some(ref rbc) = sim.rbc_counter {
-            let _ = rbc.disable();
-        }
-        // Pause preemption timer — prevent signals while &mut SimulatorState exists
-        crate::preempt::pause_timer();
 
-        let result = f(sim);
+        // SAFETY: We hold a valid pointer installed by enter_sim, and
+        // the simulation is single-threaded (token-serialized).
+        // We scope the &mut borrow tightly to avoid aliasing during
+        // the post-kfunc yield.
+        let result = {
+            let sim = unsafe { &mut *ptr };
+            // Track kfunc call count and cost for RBC accounting
+            sim.rbc_kfunc_calls += 1;
+            sim.rbc_kfunc_ns += cost_ns;
+            // Pause RBC counter — kfunc code is not scheduler code
+            if let Some(ref rbc) = sim.rbc_counter {
+                let _ = rbc.disable();
+            }
+            // Pause preemption timer — prevent signals while &mut SimulatorState exists
+            crate::preempt::pause_timer();
+
+            let result = f(sim);
+
+            // Resume RBC counter — returning to scheduler C code
+            if let Some(ref rbc) = sim.rbc_counter {
+                let _ = rbc.enable();
+            }
+            result
+        };
+        // &mut SimulatorState borrow ended — safe to yield.
 
         // Resume preemption timer — returning to scheduler C code
         crate::preempt::resume_timer();
-        // Resume RBC counter — returning to scheduler C code
-        if let Some(ref rbc) = sim.rbc_counter {
-            let _ = rbc.enable();
-        }
+
+        // Post-kfunc cooperative yield — give other workers a chance
+        // to run after this kfunc completes. This catches concurrency
+        // bugs that manifest when another worker interleaves between
+        // consecutive kfuncs. The yield disables the timer, yields,
+        // and re-arms on resume.
+        crate::preempt::maybe_yield_preemptive_post();
+
         result
     })
 }

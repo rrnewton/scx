@@ -1071,13 +1071,38 @@ pub fn uninstall() {
 // Cooperative yield via PreemptRing (replaces interleave::maybe_yield)
 // ---------------------------------------------------------------------------
 
+/// Whether a cooperative kfunc yield occurs before or after the kfunc body.
+///
+/// Pre-kfunc yields happen before `with_sim()` — the timer is left disabled
+/// and `with_sim()` re-arms it via `resume_timer()`.
+///
+/// Post-kfunc yields happen inside `with_sim()` after `resume_timer()` — the
+/// timer was just re-armed, so we must disable it before yielding and re-arm
+/// it again on resume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KfuncYieldPhase {
+    /// Yield BEFORE the kfunc body executes.
+    Pre,
+    /// Yield AFTER the kfunc body completes.
+    Post,
+}
+
+impl std::fmt::Display for KfuncYieldPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KfuncYieldPhase::Pre => write!(f, "kfunc"),
+            KfuncYieldPhase::Post => write!(f, "kfunc-post"),
+        }
+    }
+}
+
 /// Cooperative yield point for kfunc entry (using the PreemptRing).
 ///
 /// Functionally identical to [`interleave::maybe_yield`] but uses the
 /// futex-based `PreemptRing` instead of `Mutex`/`Condvar` `TokenRing`.
 ///
 /// The PMU timer is disabled on entry and stays disabled on return.
-/// The caller (via `with_sim()` → `resume_timer()`) is responsible for
+/// The caller (via `with_sim()` -> `resume_timer()`) is responsible for
 /// re-arming the timer before returning to scheduler C code.
 ///
 /// # Safety contract
@@ -1085,6 +1110,31 @@ pub fn uninstall() {
 /// Must be called BEFORE `with_sim()`, so no `&mut SimulatorState`
 /// reference exists when the worker yields.
 pub fn maybe_yield_preemptive() {
+    cooperative_yield_impl(KfuncYieldPhase::Pre);
+}
+
+/// Post-kfunc cooperative yield point (using the PreemptRing).
+///
+/// Called from `with_sim()` after `resume_timer()`. The timer was just
+/// re-armed, so this function disables it before yielding and re-arms
+/// it on resume. This gives us a guaranteed interleaving point after
+/// every kfunc completes, catching concurrency bugs that only manifest
+/// when another worker runs between consecutive kfuncs.
+///
+/// # Safety contract
+///
+/// Must be called when no `&mut SimulatorState` reference exists.
+/// Inside `with_sim()`, the `&mut` borrow ends when `f(sim)` returns,
+/// so calling this after `resume_timer()` is safe.
+pub fn maybe_yield_preemptive_post() {
+    cooperative_yield_impl(KfuncYieldPhase::Post);
+}
+
+/// Shared implementation for pre- and post-kfunc cooperative yields.
+///
+/// Saves/restores `SimulatorState` per-callback context across the yield,
+/// manages the PMU timer, and records instrumentation.
+fn cooperative_yield_impl(phase: KfuncYieldPhase) {
     let ctx = PREEMPT_CTX.with(|c| c.get());
     let ctx = match ctx {
         Some(ctx) => ctx,
@@ -1099,7 +1149,7 @@ pub fn maybe_yield_preemptive() {
 
     // Save per-callback context from SimulatorState.
     let sim_ptr: *mut SimulatorState = crate::kfuncs::sim_state_ptr()
-        .expect("maybe_yield_preemptive called outside simulator context");
+        .expect("cooperative_yield_impl called outside simulator context");
 
     let (saved_cpu, saved_ops_ctx, saved_waker) = unsafe {
         (
@@ -1121,7 +1171,7 @@ pub fn maybe_yield_preemptive() {
     // Release token and block until re-selected (futex-based).
     ring.inc_cooperative_yield();
     tracing::debug!(
-        "preempt:kfunc cooperative, structop#{0}:{1} kfunc#{2} (rbc={3})",
+        "preempt:{phase} cooperative, structop#{0}:{1} kfunc#{2} (rbc={3})",
         sinfo.cpu_count,
         sinfo.global_count,
         sinfo.kfunc_count,
@@ -1131,7 +1181,7 @@ pub fn maybe_yield_preemptive() {
 
     // Resumed — restore our context to SimulatorState.
     tracing::debug!(
-        "preempt: resumed (kfunc), structop#{0}:{1}",
+        "preempt: resumed ({phase}), structop#{0}:{1}",
         sinfo.cpu_count,
         sinfo.global_count,
     );
@@ -1141,7 +1191,12 @@ pub fn maybe_yield_preemptive() {
         (*sim_ptr).waker_task_raw = saved_waker;
     }
 
-    // Timer stays disabled — with_sim() will re-arm via resume_timer().
+    // Timer management depends on the phase:
+    // - Pre: stays disabled — with_sim() will re-arm via resume_timer().
+    // - Post: re-arm — we're about to return to scheduler C code.
+    if phase == KfuncYieldPhase::Post {
+        rearm_timer(ring, &ctx);
+    }
 }
 
 // ---------------------------------------------------------------------------
