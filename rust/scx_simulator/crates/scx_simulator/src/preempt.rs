@@ -1126,10 +1126,10 @@ pub fn maybe_yield_preemptive() {
     // Release token and block until re-selected (futex-based).
     ring.inc_cooperative_yield();
 
-    // Record the cooperative yield as a preemption point for record/replay.
-    // The RIP is 0 (kfunc boundary marker) and rbc_count is 0 since this
-    // is a cooperative yield, not a PMU-triggered preemption.
-    ring.record_preemption(0, 0, saved_cpu, ctx.worker_id, sinfo);
+    // Note: cooperative yields are NOT recorded in the preemption trace.
+    // They're deterministic (same code path = same kfunc calls) so the
+    // replay engine doesn't need them. Only PMU-triggered preemptions
+    // are recorded for replay via hardware breakpoints.
 
     tracing::debug!(
         worker = ctx.worker_id.0,
