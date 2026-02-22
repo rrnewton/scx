@@ -314,11 +314,15 @@ impl Monitor for NoopMonitor {
     fn sample(&mut self, _ctx: &ProbeContext) {}
 }
 
-/// Reset and enable the RBC counter before an ops call.
+/// Reset kfunc accumulators and enable the RBC counter before an ops call.
+///
+/// The kfunc counters are always reset so that `charge_sched_time` can
+/// apply the accumulated kfunc cost even when the RBC counter is
+/// unavailable (interleaving mode, VM/container, etc.).
 fn start_rbc(state: &mut SimulatorState) {
+    state.rbc_kfunc_calls = 0;
+    state.rbc_kfunc_ns = 0;
     if let Some(ref rbc) = state.rbc_counter {
-        state.rbc_kfunc_calls = 0;
-        state.rbc_kfunc_ns = 0;
         let _ = rbc.reset();
         let _ = rbc.enable();
     }
@@ -334,7 +338,12 @@ fn update_sum_exec(raw: *mut c_void, base: TimeNs, elapsed: TimeNs) {
     unsafe { ffi::sim_task_set_sum_exec_runtime(raw, base + elapsed) };
 }
 
-/// Disable the RBC counter, read the count, and charge RBC-derived time to `cpu`.
+/// Disable the RBC counter, read the count, and charge scheduler overhead to `cpu`.
+///
+/// When the RBC counter is available, overhead = RBC-derived time + kfunc cost.
+/// When the RBC counter is unavailable (interleaving mode, VM, etc.), the
+/// accumulated kfunc cost from `with_sim()` calls serves as a fallback timing
+/// model so that `local_clock` still advances on every callback.
 fn charge_sched_time(state: &mut SimulatorState, cpu: CpuId, ops: &str) {
     if let Some(ref rbc) = state.rbc_counter {
         let _ = rbc.disable();
@@ -353,6 +362,26 @@ fn charge_sched_time(state: &mut SimulatorState, cpu: CpuId, ops: &str) {
                 "sched overhead"
             );
         }
+    } else if state.overhead.enabled {
+        // Fallback: no RBC counter — use accumulated kfunc cost directly.
+        // Each with_sim() call adds its kfunc_cost tier to rbc_kfunc_ns,
+        // so this advances local_clock by the sum of all kfunc costs in
+        // this callback invocation. A minimum of MIN_CALLBACK_COST_NS
+        // ensures time advances even for callbacks that make no kfuncs.
+        //
+        // Gated on overhead.enabled so that instant_timing() scenarios
+        // get zero-cost transitions (matching the pre-fallback behavior).
+        const MIN_CALLBACK_COST_NS: u64 = 50;
+        let kfunc_ns = state.rbc_kfunc_ns;
+        let total_ns = kfunc_ns.max(MIN_CALLBACK_COST_NS);
+        state.cpus[cpu.0 as usize].local_clock += total_ns;
+        trace!(
+            ops,
+            kfuncs = state.rbc_kfunc_calls,
+            kfunc_ns,
+            total_ns,
+            "sched overhead (fallback)"
+        );
     }
 }
 
