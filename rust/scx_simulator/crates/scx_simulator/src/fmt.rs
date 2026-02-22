@@ -48,15 +48,15 @@ pub enum TsKind {
     Global,
 }
 
-/// Timestamp formatter with underscore-grouped digits and `:L`/`:G` suffix.
+/// Timestamp formatter with underscore-grouped digits and `:cpu`/`:G` suffix.
 ///
 /// Formats nanosecond timestamps for trace output with room for 12 digits
 /// (up to ~15 seconds), grouped in 3s with underscores, right-aligned.
 ///
 /// When a CPU ID is present, the suffix includes the zero-padded CPU number:
-/// - `[   988_779_026:L01]` — CPU 1, 2-digit padding
-/// - `[   988_779_026:L]`   — no CPU context (e.g. timer events)
-/// - `[   988_779_026:G]`   — global timestamp
+/// - `[  988_779_026:cpu01]` — CPU 1, 2-digit padding
+/// - `[  988_779_026:cpu]`   — no CPU context (e.g. timer events)
+/// - `[  988_779_026:G]`     — global timestamp
 pub struct FmtTs {
     pub ns: TimeNs,
     pub kind: TsKind,
@@ -101,10 +101,10 @@ impl fmt::Display for FmtTs {
         match self.kind {
             TsKind::Local(Some(cpu), width) => {
                 let w = width as usize;
-                write!(f, "{:>15}:L{:0>w$}", grouped, cpu.0, w = w)
+                write!(f, "{:>15}:cpu{:0>w$}", grouped, cpu.0, w = w)
             }
             TsKind::Local(None, _) => {
-                write!(f, "{:>15}:L", grouped)
+                write!(f, "{:>15}:cpu", grouped)
             }
             TsKind::Global => {
                 write!(f, "{:>15}:G", grouped)
@@ -243,36 +243,36 @@ mod tests {
         use crate::types::CpuId;
 
         // No CPU context (e.g. timer events)
-        assert_eq!(FmtTs::local(0, None, 1).to_string(), "              0:L");
+        assert_eq!(FmtTs::local(0, None, 1).to_string(), "              0:cpu");
         assert_eq!(
             FmtTs::local(10_000, None, 1).to_string(),
-            "         10_000:L"
+            "         10_000:cpu"
         );
 
         // With CPU ID, width=1
         assert_eq!(
             FmtTs::local(10_000, Some(CpuId(0)), 1).to_string(),
-            "         10_000:L0"
+            "         10_000:cpu0"
         );
         assert_eq!(
             FmtTs::local(10_000, Some(CpuId(3)), 1).to_string(),
-            "         10_000:L3"
+            "         10_000:cpu3"
         );
 
         // With CPU ID, width=2
         assert_eq!(
             FmtTs::local(20_000_000, Some(CpuId(1)), 2).to_string(),
-            "     20_000_000:L01"
+            "     20_000_000:cpu01"
         );
         assert_eq!(
             FmtTs::local(20_000_000, Some(CpuId(12)), 2).to_string(),
-            "     20_000_000:L12"
+            "     20_000_000:cpu12"
         );
 
         // With CPU ID, width=3
         assert_eq!(
             FmtTs::local(0, Some(CpuId(5)), 3).to_string(),
-            "              0:L005"
+            "              0:cpu005"
         );
 
         // Global timestamp

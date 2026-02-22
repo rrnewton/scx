@@ -1025,20 +1025,19 @@ pub fn maybe_yield_preemptive() {
     // Release token and block until re-selected (futex-based).
     ring.inc_cooperative_yield();
     tracing::debug!(
-        "preempt:kfunc cooperative, structop#{0}:{1} kfunc#{2} worker={3}",
+        "preempt:kfunc cooperative, structop#{0}:{1} kfunc#{2} (rbc={3})",
         sinfo.cpu_count,
         sinfo.global_count,
         sinfo.kfunc_count,
-        ctx.worker_id.0,
+        sinfo.rbc_total,
     );
     ring.yield_token(ctx.worker_id);
 
     // Resumed — restore our context to SimulatorState.
     tracing::debug!(
-        "preempt: resumed (kfunc), structop#{0}:{1} worker={2}",
+        "preempt: resumed (kfunc), structop#{0}:{1}",
         sinfo.cpu_count,
         sinfo.global_count,
-        ctx.worker_id.0,
     );
     unsafe {
         (*sim_ptr).current_cpu = saved_cpu;
