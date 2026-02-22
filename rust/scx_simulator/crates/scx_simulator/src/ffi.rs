@@ -278,6 +278,15 @@ pub trait Scheduler {
     /// Calls into C code.
     unsafe fn cpu_offline(&self, _cpu: i32) {}
 
+    /// Whether the scheduler implements the `tick` callback.
+    ///
+    /// Used to decide whether Stalker instrumentation is worthwhile for
+    /// Tick-only batches: if `tick` is not implemented, Tick events won't
+    /// call any `.so` code, so Stalker DBI overhead is wasted.
+    fn has_tick(&self) -> bool {
+        false
+    }
+
     /// Return the `.text` section base address and size of the loaded scheduler.
     ///
     /// Used by Frida Stalker to restrict instrumentation to scheduler code only.
@@ -969,6 +978,10 @@ impl Scheduler for DynamicScheduler {
         if let Some(f) = self.ops.cpu_offline {
             f(cpu);
         }
+    }
+
+    fn has_tick(&self) -> bool {
+        self.ops.tick.is_some()
     }
 
     #[cfg(feature = "frida")]

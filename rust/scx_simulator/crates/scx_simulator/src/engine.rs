@@ -3167,9 +3167,27 @@ impl<S: Scheduler> Simulator<S> {
             // When Frida is enabled, use Stalker software RBC instead of
             // PMU hardware counters. This provides deterministic preemption
             // without hardware PMU support.
+            //
+            // Optimization: skip Stalker when the batch contains only Tick
+            // events and the scheduler doesn't implement `tick`. In that
+            // case no scheduler `.so` code will execute, so Stalker DBI
+            // overhead is wasted (zero callouts). Fall back to cooperative
+            // interleaving which is sufficient since kfunc boundaries
+            // provide natural yield points.
             #[cfg(feature = "frida")]
             let used_frida = if preemptive_cfg.use_frida {
-                if let Some(range) = self.scheduler.text_range() {
+                let all_ticks = per_cpu
+                    .values()
+                    .flat_map(|v| v.iter())
+                    .all(|e| matches!(e.kind, EventKind::Tick { .. }));
+                let skip_frida = all_ticks && !self.scheduler.has_tick();
+                if skip_frida {
+                    debug!(
+                        workers = cpu_ids.len(),
+                        "batch-concurrent frida: skipping (tick-only batch, scheduler has no tick)"
+                    );
+                    false
+                } else if let Some(range) = self.scheduler.text_range() {
                     let gum = frida_gum();
 
                     let text_range = crate::stalker::TextRange {
