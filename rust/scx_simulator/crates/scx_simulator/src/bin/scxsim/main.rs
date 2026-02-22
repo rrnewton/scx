@@ -8,8 +8,8 @@ use scx_simulator::scenario::{parse_duration_ns, parse_seed};
 use scx_simulator::{
     compare_checkpoints, discover_schedulers, drain_determinism_checkpoints,
     drain_preemption_records, enable_determinism_mode, enable_preemption_collection, load_rtapp,
-    scheduler_so_base, DynamicScheduler, PreemptionTrace, PreemptiveConfig, SimFormat, Simulator,
-    SIM_LOCK,
+    scheduler_so_base, DynamicScheduler, PmuEvent, PreemptionTrace, PreemptiveConfig, SimFormat,
+    Simulator, SIM_LOCK,
 };
 
 mod real_run;
@@ -22,6 +22,26 @@ pub enum RealRunMode {
     Off,
     /// Launch virtme-ng VM with rt-app and scheduler.
     Vm,
+}
+
+/// Which PMU event to break on for preemptive interleaving.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum BreakOn {
+    /// Retired conditional branches (default, lower frequency).
+    #[default]
+    Rbc,
+    /// Instructions retired (higher frequency — use larger timeslice).
+    Insn,
+}
+
+impl BreakOn {
+    /// Convert to the corresponding `PmuEvent`.
+    fn to_pmu_event(self) -> PmuEvent {
+        match self {
+            BreakOn::Rbc => PmuEvent::RetiredBranchConditional,
+            BreakOn::Insn => PmuEvent::InstructionsRetired,
+        }
+    }
 }
 
 /// Run sched_ext scheduler simulations from rt-app workloads.
@@ -131,6 +151,13 @@ struct Cli {
     #[arg(long, default_value_t = 1, requires = "preemptive")]
     timeslice_max: u64,
 
+    /// Which PMU event to break on for preemptive interleaving.
+    ///
+    /// rbc: Retired conditional branches (default, lower frequency).
+    /// insn: Instructions retired (higher frequency — use larger timeslice).
+    #[arg(long, value_enum, default_value_t = BreakOn::Rbc, requires = "preemptive")]
+    break_on: BreakOn,
+
     /// List available schedulers and exit.
     #[arg(long)]
     list_schedulers: bool,
@@ -230,6 +257,7 @@ fn run(cli: &Cli) -> Result<(), String> {
             timeslice_min: cli.timeslice_min,
             timeslice_max: cli.timeslice_max,
             cooperative_only: false,
+            break_on: cli.break_on.to_pmu_event(),
         });
         scenario.interleave = true;
     }
@@ -417,7 +445,8 @@ fn run_simulation(cli: &Cli, scenario: scx_simulator::Scenario) -> Result<(), St
     if let Some(path) = &cli.record_preemptions {
         let records = drain_preemption_records();
         let num_workers = cli.cpus as usize;
-        let preemption_trace = PreemptionTrace::from_records(&records, num_workers);
+        let preemption_trace =
+            PreemptionTrace::from_records(&records, num_workers, cli.break_on.to_pmu_event());
         let so_base = scheduler_so_base();
 
         let mut file = std::fs::File::create(path)

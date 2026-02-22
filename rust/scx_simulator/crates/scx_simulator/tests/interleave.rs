@@ -922,6 +922,7 @@ fn test_preemptive_custom_timeslice() {
             timeslice_min: 50,
             timeslice_max: 200,
             cooperative_only: false,
+            ..Default::default()
         })
         .task(TaskDef {
             name: "t1".into(),
@@ -989,6 +990,7 @@ fn pmu_preemptive_scenario(nr_cpus: u32, nr_tasks: u32, seed: u32, duration_ms: 
             timeslice_min: 100,
             timeslice_max: 500,
             cooperative_only: false, // Enable PMU
+            ..Default::default()
         });
 
     for i in 1..=nr_tasks {

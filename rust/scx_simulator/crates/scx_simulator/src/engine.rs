@@ -61,6 +61,38 @@ struct SendPtr<T>(*mut T);
 unsafe impl<T> Send for SendPtr<T> {}
 unsafe impl<T> Sync for SendPtr<T> {}
 
+/// Create and configure a per-thread PMU timer for preemptive interleaving.
+///
+/// Returns `(Option<RbcTimer>, RawFd)`. The timer is created using the given
+/// `break_on` event type. If `cooperative_only` is true, or if the PMU is
+/// unavailable, returns `(None, -1)`.
+///
+/// Must be called from the worker thread (routes signal delivery to current tid).
+fn setup_pmu_timer(
+    cooperative_only: bool,
+    break_on: perf::PmuEvent,
+) -> (Option<perf::RbcTimer>, std::os::unix::io::RawFd) {
+    use crate::preempt;
+
+    if cooperative_only {
+        return (None, -1);
+    }
+    let timer = perf::try_create_pmu_timer(break_on);
+    let timer_fd = match &timer {
+        Some(t) => {
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::pid_t;
+            if let Err(e) = t.set_signal_delivery(tid, preempt::PREEMPT_SIGNAL) {
+                tracing::warn!("preemptive: signal delivery setup failed: {e}");
+                -1
+            } else {
+                t.raw_fd()
+            }
+        }
+        None => -1,
+    };
+    (timer, timer_fd)
+}
+
 /// SCX wake flags.
 const SCX_ENQ_WAKEUP: u64 = 0x1;
 /// Synchronous wakeup: waker is about to sleep/yield, hinting the scheduler
@@ -856,7 +888,8 @@ impl<S: Scheduler> Simulator<S> {
                 warn!(
                     timeslice_min = cfg.timeslice_min,
                     timeslice_max = cfg.timeslice_max,
-                    "preemptive mode: PMU RBC preemption is NONDETERMINISTIC \
+                    break_on = %cfg.break_on,
+                    "preemptive mode: PMU preemption is NONDETERMINISTIC \
                      (use --record-preemptions / --replay-preemptions for deterministic replay)"
                 );
             }
@@ -864,7 +897,8 @@ impl<S: Scheduler> Simulator<S> {
                 timeslice_min = cfg.timeslice_min,
                 timeslice_max = cfg.timeslice_max,
                 cooperative_only = cfg.cooperative_only,
-                "preemptive interleaving enabled (PMU RBC timer)"
+                break_on = %cfg.break_on,
+                "preemptive interleaving enabled (PMU {} timer)", cfg.break_on
             );
         } else if state.interleave {
             info!("cooperative interleaving enabled (kfunc boundaries only)");
@@ -2750,6 +2784,7 @@ impl<S: Scheduler> Simulator<S> {
             let timeslice_min = preemptive_cfg.timeslice_min;
             let timeslice_max = preemptive_cfg.timeslice_max;
             let cooperative_only = preemptive_cfg.cooperative_only;
+            let break_on = preemptive_cfg.break_on;
             self.dispatch_concurrent_preemptive(
                 &dispatch_cpus,
                 &state_send,
@@ -2758,6 +2793,7 @@ impl<S: Scheduler> Simulator<S> {
                 timeslice_min,
                 timeslice_max,
                 cooperative_only,
+                break_on,
             );
         } else {
             self.dispatch_concurrent_cooperative(
@@ -2911,6 +2947,7 @@ impl<S: Scheduler> Simulator<S> {
         timeslice_min: u64,
         timeslice_max: u64,
         cooperative_only: bool,
+        break_on: crate::perf::PmuEvent,
     ) {
         use crate::interleave::WorkerId;
         use crate::preempt::{self, PreemptRing};
@@ -2942,29 +2979,7 @@ impl<S: Scheduler> Simulator<S> {
 
                     // Create per-thread PMU timer (may be unavailable in VMs).
                     // Skip if cooperative_only mode is requested.
-                    let (timer, timer_fd) = if cooperative_only {
-                        (None, -1)
-                    } else {
-                        let timer = perf::try_create_rbc_timer();
-                        let timer_fd = match &timer {
-                            Some(t) => {
-                                // Route overflow signal to this thread.
-                                let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::pid_t;
-                                if let Err(e) = t.set_signal_delivery(tid, preempt::PREEMPT_SIGNAL)
-                                {
-                                    tracing::warn!(
-                                        "preemptive interleave: signal delivery \
-                                         setup failed: {e}"
-                                    );
-                                    -1
-                                } else {
-                                    t.raw_fd()
-                                }
-                            }
-                            None => -1,
-                        };
-                        (timer, timer_fd)
-                    };
+                    let (timer, timer_fd) = setup_pmu_timer(cooperative_only, break_on);
 
                     if cooperative_only {
                         debug!(
@@ -2973,7 +2988,7 @@ impl<S: Scheduler> Simulator<S> {
                             "preempt: cooperative-only (by config)"
                         );
                     } else if timer_fd >= 0 {
-                        debug!(worker = i, cpu = cpu.0, "preempt: PMU timer armed");
+                        debug!(worker = i, cpu = cpu.0, %break_on, "preempt: PMU timer armed");
                     } else {
                         debug!(
                             worker = i,
@@ -3137,6 +3152,7 @@ impl<S: Scheduler> Simulator<S> {
                 preemptive_cfg.timeslice_min,
                 preemptive_cfg.timeslice_max,
                 preemptive_cfg.cooperative_only,
+                preemptive_cfg.break_on,
             );
         } else {
             Self::process_batch_concurrent_cooperative(
@@ -3254,6 +3270,7 @@ impl<S: Scheduler> Simulator<S> {
         timeslice_min: u64,
         timeslice_max: u64,
         cooperative_only: bool,
+        break_on: crate::perf::PmuEvent,
     ) {
         use crate::interleave::WorkerId;
         use crate::preempt::{self, PreemptRing};
@@ -3280,27 +3297,7 @@ impl<S: Scheduler> Simulator<S> {
 
                     // Create per-thread PMU timer.
                     // Skip if cooperative_only mode is requested.
-                    let (timer, timer_fd) = if cooperative_only {
-                        (None, -1)
-                    } else {
-                        let timer = perf::try_create_rbc_timer();
-                        let timer_fd = match &timer {
-                            Some(t) => {
-                                let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::pid_t;
-                                if let Err(e) = t.set_signal_delivery(tid, preempt::PREEMPT_SIGNAL)
-                                {
-                                    tracing::warn!(
-                                        "batch preemptive: signal delivery setup failed: {e}"
-                                    );
-                                    -1
-                                } else {
-                                    t.raw_fd()
-                                }
-                            }
-                            None => -1,
-                        };
-                        (timer, timer_fd)
-                    };
+                    let (timer, timer_fd) = setup_pmu_timer(cooperative_only, break_on);
 
                     preempt::install(ring_ref, worker_id, timer_fd, timeslice_min, timeslice_max);
 

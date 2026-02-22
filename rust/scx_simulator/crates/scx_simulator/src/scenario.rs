@@ -3,6 +3,7 @@
 use tracing::warn;
 
 use crate::cgroup::DEFAULT_MAX_CGROUPS;
+use crate::perf::PmuEvent;
 use crate::task::{TaskBehavior, TaskDef};
 use crate::types::{CpuId, MmId, Pid, TimeNs};
 
@@ -191,27 +192,33 @@ impl NoiseConfig {
 
 /// Configuration for preemptive interleaving via PMU timer signals.
 ///
-/// When enabled, dispatch callbacks are preempted at random retired
-/// conditional branch count intervals, enabling exploration of mid-C-code
-/// interleavings beyond the cooperative kfunc-boundary yield points.
+/// When enabled, dispatch callbacks are preempted at random PMU event
+/// count intervals, enabling exploration of mid-C-code interleavings
+/// beyond the cooperative kfunc-boundary yield points.
 ///
-/// The timeslice (in retired conditional branches) is rolled uniformly
-/// in `[timeslice_min, timeslice_max]` from the interleave PRNG.
+/// The timeslice (in PMU events) is rolled uniformly in
+/// `[timeslice_min, timeslice_max]` from the interleave PRNG.
 ///
 /// The default is min=max=1, requesting the smallest possible timeslice.
 /// In practice, PMU skid means the actual preemption point will be tens
-/// to hundreds of branches after the requested count, so even min=1
+/// to hundreds of events after the requested count, so even min=1
 /// produces a useful range of preemption points.
 #[derive(Debug, Clone)]
 pub struct PreemptiveConfig {
-    /// Minimum timeslice in retired conditional branches.
+    /// Minimum timeslice in PMU events.
     pub timeslice_min: u64,
-    /// Maximum timeslice in retired conditional branches.
+    /// Maximum timeslice in PMU events.
     pub timeslice_max: u64,
     /// If true, disable PMU timers and use only cooperative yields at kfunc
     /// boundaries. This ensures deterministic interleaving regardless of
     /// hardware behavior. Default: false (use PMU when available).
     pub cooperative_only: bool,
+    /// Which PMU event to break on. Default: `RetiredBranchConditional`.
+    ///
+    /// `InstructionsRetired` fires more frequently (every instruction vs.
+    /// every conditional branch), so `timeslice_min`/`timeslice_max` may
+    /// need to be larger to avoid excessive preemption overhead.
+    pub break_on: PmuEvent,
 }
 
 impl Default for PreemptiveConfig {
@@ -220,6 +227,7 @@ impl Default for PreemptiveConfig {
             timeslice_min: 1,
             timeslice_max: 1,
             cooperative_only: false,
+            break_on: PmuEvent::RetiredBranchConditional,
         }
     }
 }

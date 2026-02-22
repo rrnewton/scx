@@ -58,12 +58,37 @@ impl fmt::Display for PerfError {
 }
 
 /// A PMU hardware event type.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PmuEvent {
     /// Retired conditional branches (vendor-specific raw event).
     RetiredBranchConditional,
     /// Hardware instructions retired (PERF_TYPE_HARDWARE + PERF_COUNT_HW_INSTRUCTIONS).
     InstructionsRetired,
+}
+
+impl PmuEvent {
+    /// Short identifier for serialization (e.g. in trace headers).
+    pub fn short_name(self) -> &'static str {
+        match self {
+            PmuEvent::RetiredBranchConditional => "rbc",
+            PmuEvent::InstructionsRetired => "insn",
+        }
+    }
+
+    /// Parse from the short identifier. Returns `None` if unrecognized.
+    pub fn from_short_name(s: &str) -> Option<Self> {
+        match s {
+            "rbc" => Some(PmuEvent::RetiredBranchConditional),
+            "insn" => Some(PmuEvent::InstructionsRetired),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for PmuEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.short_name())
+    }
 }
 
 /// PMU configuration for retired conditional branches.
@@ -459,17 +484,26 @@ pub fn try_create_rbc_counter() -> Option<RbcCounter> {
 /// The timer starts with [`RbcTimer::DISABLE_SAMPLE_PERIOD`] so it won't
 /// fire until a real period is set via [`RbcTimer::set_period`].
 pub fn try_create_rbc_timer() -> Option<RbcTimer> {
+    try_create_pmu_timer(PmuEvent::RetiredBranchConditional)
+}
+
+/// Try to create a PMU timer for an arbitrary event, returning `None` with a
+/// warning if unavailable.
+///
+/// The timer starts with [`RbcTimer::DISABLE_SAMPLE_PERIOD`] so it won't
+/// fire until a real period is set via [`RbcTimer::set_period`].
+pub fn try_create_pmu_timer(event: PmuEvent) -> Option<RbcTimer> {
     let config = match PmuConfig::detect() {
         Some(c) => c,
         None => {
-            tracing::warn!("RBC timer: CPU not supported (no CPUID match)");
+            tracing::warn!("PMU timer ({event}): CPU not supported (no CPUID match)");
             return None;
         }
     };
-    match RbcTimer::new(&config, RbcTimer::DISABLE_SAMPLE_PERIOD) {
+    match RbcTimer::new_event(&config, event, RbcTimer::DISABLE_SAMPLE_PERIOD) {
         Ok(timer) => Some(timer),
         Err(e) => {
-            tracing::warn!("RBC timer unavailable: {e}");
+            tracing::warn!("PMU timer ({event}) unavailable: {e}");
             None
         }
     }

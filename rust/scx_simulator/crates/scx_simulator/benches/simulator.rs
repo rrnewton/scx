@@ -227,6 +227,7 @@ fn interleave_contention_scenario(interleave: bool, preemptive: bool) -> Scenari
             timeslice_min: 100,
             timeslice_max: 1000,
             cooperative_only: false,
+            ..Default::default()
         });
     }
 
@@ -262,6 +263,7 @@ fn interleave_sleep_wake_scenario(interleave: bool, preemptive: bool) -> Scenari
             timeslice_min: 100,
             timeslice_max: 1000,
             cooperative_only: false,
+            ..Default::default()
         });
     }
 

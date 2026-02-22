@@ -8,6 +8,7 @@
 use std::io::{BufRead, Write};
 
 use crate::interleave::WorkerId;
+use crate::perf::PmuEvent;
 use crate::types::CpuId;
 
 use super::{PreemptionRecord, PreemptionRecordStore};
@@ -22,6 +23,9 @@ pub struct PreemptionTrace {
     /// Per-worker preemption points, ordered by sequence number.
     /// Index = worker_id.0
     per_worker: Vec<Vec<PreemptionRecord>>,
+    /// Which PMU event was used for preemption timing.
+    /// All records in the trace share the same event type.
+    break_on: PmuEvent,
 }
 
 impl PreemptionTrace {
@@ -29,7 +33,11 @@ impl PreemptionTrace {
     ///
     /// Records are grouped by `worker_id` and sorted by sequence number
     /// within each group so that replay follows the original ordering.
-    pub fn from_records(records: &[PreemptionRecord], num_workers: usize) -> Self {
+    pub fn from_records(
+        records: &[PreemptionRecord],
+        num_workers: usize,
+        break_on: PmuEvent,
+    ) -> Self {
         let mut per_worker: Vec<Vec<PreemptionRecord>> =
             (0..num_workers).map(|_| Vec::new()).collect();
         for rec in records {
@@ -42,14 +50,21 @@ impl PreemptionTrace {
         for bucket in &mut per_worker {
             bucket.sort_by_key(|r| r.sequence);
         }
-        PreemptionTrace { per_worker }
+        PreemptionTrace {
+            per_worker,
+            break_on,
+        }
     }
 
     /// Build a trace by draining records from a `PreemptionRecordStore`.
     #[allow(dead_code)] // Infrastructure for replay engine.
-    pub(crate) fn from_store(store: &PreemptionRecordStore, num_workers: usize) -> Self {
+    pub(crate) fn from_store(
+        store: &PreemptionRecordStore,
+        num_workers: usize,
+        break_on: PmuEvent,
+    ) -> Self {
         let records = store.drain();
-        Self::from_records(&records, num_workers)
+        Self::from_records(&records, num_workers, break_on)
     }
 
     /// Get the preemption points for a specific worker.
@@ -75,12 +90,18 @@ impl PreemptionTrace {
         self.per_worker.len()
     }
 
+    /// Which PMU event type was used for preemption timing.
+    pub fn break_on(&self) -> PmuEvent {
+        self.break_on
+    }
+
     /// Serialize the trace to a line-oriented text format.
     ///
     /// Format:
     /// ```text
     /// # scxsim preemption trace
     /// # workers: 2
+    /// # break_on: rbc
     /// # total: 47
     /// seq=0 structop=1:2 rbc=10 timeslice=142 rip=0x7f3a rip_offset=0xc7c cpu=0 worker=0
     /// ```
@@ -92,6 +113,7 @@ impl PreemptionTrace {
         let total = self.len();
         writeln!(w, "# scxsim preemption trace")?;
         writeln!(w, "# workers: {}", self.per_worker.len())?;
+        writeln!(w, "# break_on: {}", self.break_on.short_name())?;
         writeln!(w, "# total: {total}")?;
 
         // Flatten and sort by sequence for canonical output order.
@@ -124,12 +146,15 @@ impl PreemptionTrace {
 
     /// Deserialize a trace from the line-oriented text format.
     ///
-    /// Parses the header to get the worker count, then each `seq=...` line
-    /// into a `PreemptionRecord`. Uses `rip_offset` + `so_base` to
-    /// reconstruct absolute RIPs if the current .so base differs from
-    /// the recording.
+    /// Parses the header to get the worker count and break_on event type,
+    /// then each `seq=...` line into a `PreemptionRecord`. Uses
+    /// `rip_offset` + `so_base` to reconstruct absolute RIPs if the
+    /// current .so base differs from the recording.
+    ///
+    /// Old traces without a `# break_on:` header default to `rbc`.
     pub fn deserialize(r: &mut impl BufRead, so_base: u64) -> std::io::Result<Self> {
         let mut num_workers: usize = 0;
+        let mut break_on = PmuEvent::RetiredBranchConditional; // default for old traces
         let mut records = Vec::new();
 
         for line in r.lines() {
@@ -145,6 +170,10 @@ impl PreemptionTrace {
                         .trim()
                         .parse()
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                } else if let Some(rest) = line.strip_prefix("# break_on: ") {
+                    if let Some(event) = PmuEvent::from_short_name(rest.trim()) {
+                        break_on = event;
+                    }
                 }
                 continue;
             }
@@ -163,7 +192,7 @@ impl PreemptionTrace {
             num_workers = records.iter().map(|r| r.worker_id.0).max().unwrap_or(0) + 1;
         }
 
-        Ok(Self::from_records(&records, num_workers))
+        Ok(Self::from_records(&records, num_workers, break_on))
     }
 }
 
@@ -287,7 +316,7 @@ mod tests {
             make_record(3, 400, 0x4000, 1, 1, 1, 2, 600),
         ];
 
-        let trace = PreemptionTrace::from_records(&records, 2);
+        let trace = PreemptionTrace::from_records(&records, 2, PmuEvent::RetiredBranchConditional);
         assert_eq!(trace.num_workers(), 2);
         assert_eq!(trace.len(), 4);
 
@@ -307,7 +336,7 @@ mod tests {
 
     #[test]
     fn test_preemption_trace_empty() {
-        let trace = PreemptionTrace::from_records(&[], 3);
+        let trace = PreemptionTrace::from_records(&[], 3, PmuEvent::RetiredBranchConditional);
         assert_eq!(trace.num_workers(), 3);
         assert_eq!(trace.len(), 0);
         assert!(trace.is_empty());
@@ -322,7 +351,7 @@ mod tests {
             make_record(2, 300, 0x7f000030e0, 0, 0, 1, 1, 400),
         ];
 
-        let trace = PreemptionTrace::from_records(&records, 2);
+        let trace = PreemptionTrace::from_records(&records, 2, PmuEvent::RetiredBranchConditional);
         let so_base: u64 = 0x7f00000000;
 
         // Serialize to buffer.
@@ -333,6 +362,7 @@ mod tests {
         // Verify header.
         assert!(text.contains("# scxsim preemption trace"));
         assert!(text.contains("# workers: 2"));
+        assert!(text.contains("# break_on: rbc"));
         assert!(text.contains("# total: 3"));
 
         // Verify structop and rip_offset are present.
@@ -366,7 +396,7 @@ mod tests {
         // Record at one base address, replay at a different one.
         let records = vec![make_record(0, 42, 0x1000_1000, 0, 0, 1, 1, 42)];
 
-        let trace = PreemptionTrace::from_records(&records, 1);
+        let trace = PreemptionTrace::from_records(&records, 1, PmuEvent::RetiredBranchConditional);
         let record_base: u64 = 0x1000_0000;
 
         // Serialize with record-time base.
@@ -416,5 +446,58 @@ mod tests {
         let rec = parse_preemption_line(line, 0).unwrap();
         assert_eq!(rec.rbc_count, 100);
         assert_eq!(rec.instruction_pointer, 0x1000);
+    }
+
+    #[test]
+    fn test_break_on_insn_roundtrip() {
+        let records = vec![
+            make_record(0, 500, 0x7f000010c0, 0, 0, 1, 1, 500),
+            make_record(1, 1000, 0x7f000020d0, 1, 1, 1, 2, 1000),
+        ];
+
+        let trace = PreemptionTrace::from_records(&records, 2, PmuEvent::InstructionsRetired);
+        assert_eq!(trace.break_on(), PmuEvent::InstructionsRetired);
+
+        let so_base: u64 = 0x7f00000000;
+        let mut buf = Vec::new();
+        trace.serialize(&mut buf, so_base).unwrap();
+        let text = String::from_utf8(buf.clone()).unwrap();
+
+        // Verify insn header is present.
+        assert!(text.contains("# break_on: insn"));
+
+        // Deserialize and verify break_on is preserved.
+        let mut cursor = std::io::Cursor::new(buf);
+        let trace2 = PreemptionTrace::deserialize(&mut cursor, so_base).unwrap();
+        assert_eq!(trace2.break_on(), PmuEvent::InstructionsRetired);
+        assert_eq!(trace2.num_workers(), 2);
+        assert_eq!(trace2.len(), 2);
+    }
+
+    #[test]
+    fn test_deserialize_old_trace_defaults_to_rbc() {
+        // Old trace without # break_on: header should default to rbc.
+        let text = "# scxsim preemption trace\n\
+                     # workers: 1\n\
+                     # total: 1\n\
+                     seq=0 structop=1:1 rbc=50 timeslice=100 rip=0x1000 rip_offset=0x100 cpu=0 worker=0\n";
+        let mut cursor = std::io::Cursor::new(text.as_bytes());
+        let trace = PreemptionTrace::deserialize(&mut cursor, 0).unwrap();
+        assert_eq!(trace.break_on(), PmuEvent::RetiredBranchConditional);
+    }
+
+    #[test]
+    fn test_pmu_event_short_name_roundtrip() {
+        assert_eq!(
+            PmuEvent::from_short_name("rbc"),
+            Some(PmuEvent::RetiredBranchConditional)
+        );
+        assert_eq!(
+            PmuEvent::from_short_name("insn"),
+            Some(PmuEvent::InstructionsRetired)
+        );
+        assert_eq!(PmuEvent::from_short_name("unknown"), None);
+        assert_eq!(PmuEvent::RetiredBranchConditional.short_name(), "rbc");
+        assert_eq!(PmuEvent::InstructionsRetired.short_name(), "insn");
     }
 }

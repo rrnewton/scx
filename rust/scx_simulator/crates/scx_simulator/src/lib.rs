@@ -65,6 +65,7 @@ pub use ffi::{discover_schedulers, DynamicScheduler, LavdPowerMode, Scheduler, S
 pub use fmt::{FmtN, FmtTs, SimFormat};
 pub use kfuncs::sim_clock;
 pub use monitor::{Monitor, ProbeContext, ProbePoint};
+pub use perf::PmuEvent;
 pub use perf::RbcCounter;
 pub use preempt::trace::PreemptionTrace;
 pub use preempt::{
