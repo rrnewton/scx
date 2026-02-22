@@ -46,6 +46,8 @@ use crate::interleave::WorkerId;
 use crate::kfuncs::SimulatorState;
 use crate::types::CpuId;
 
+pub mod trace;
+
 // ---------------------------------------------------------------------------
 // PreemptionRecord — instrumentation for verifying determinism
 // ---------------------------------------------------------------------------
@@ -54,40 +56,60 @@ use crate::types::CpuId;
 /// This is a fixed-size ring buffer to avoid allocation in signal handlers.
 const MAX_PREEMPTION_RECORDS: usize = 4096;
 
-/// A record of a single PMU-triggered preemption point.
+/// A record of a single preemption point (PMU or cooperative kfunc yield).
 ///
 /// Captures all relevant state at the moment of preemption for verifying
 /// that RBC-based preemption is truly deterministic: same branch count,
-/// same instruction, every time.
+/// same instruction, every time. Includes structop context for correlating
+/// preemptions with scheduler ops callback invocations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PreemptionRecord {
-    /// The RBC (retired branch conditional) count that triggered this preemption.
+    /// The timeslice (retired branch conditionals) for this preemption.
+    /// For cooperative (kfunc) yields this is 0.
     pub rbc_count: u64,
     /// The instruction pointer (RIP) at the preemption point.
+    /// For cooperative (kfunc) yields this is 0.
     pub instruction_pointer: u64,
     /// The CPU ID of the worker that was preempted.
     pub cpu_id: CpuId,
+    /// The worker that was preempted (for replay grouping).
+    pub worker_id: WorkerId,
     /// Sequence number (monotonically increasing per PreemptRing).
     pub sequence: u64,
+    /// Per-worker structop count (1-based) at the time of preemption.
+    pub structop_local: u64,
+    /// Global structop count (1-based) at the time of preemption.
+    pub structop_global: u64,
+    /// Cumulative RBC within the current structop at the time of preemption.
+    pub structop_rbc: u64,
 }
 
 impl std::fmt::Display for PreemptionRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "seq={} rbc={} rip=0x{:016x} cpu={}",
-            self.sequence, self.rbc_count, self.instruction_pointer, self.cpu_id.0
+            "seq={} structop={}:{} rbc={} rip=0x{:x} cpu={} worker={}",
+            self.sequence,
+            self.structop_local,
+            self.structop_global,
+            self.structop_rbc,
+            self.instruction_pointer,
+            self.cpu_id.0,
+            self.worker_id.0
         )
     }
 }
+
+/// Number of AtomicU64 slots per preemption record.
+const RECORD_FIELDS: usize = 8;
 
 /// Fixed-size storage for preemption records (signal-safe).
 ///
 /// Uses a fixed array with atomic index to avoid heap allocation in signal
 /// handlers. Records beyond MAX_PREEMPTION_RECORDS are dropped.
-struct PreemptionRecordStore {
+pub(crate) struct PreemptionRecordStore {
     /// Fixed-size array of records (pre-allocated).
-    records: Box<[AtomicU64; MAX_PREEMPTION_RECORDS * 4]>,
+    records: Box<[AtomicU64; MAX_PREEMPTION_RECORDS * RECORD_FIELDS]>,
     /// Number of records stored (atomic for signal safety).
     count: AtomicUsize,
     /// Sequence counter for ordering records.
@@ -95,9 +117,10 @@ struct PreemptionRecordStore {
 }
 
 impl PreemptionRecordStore {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         // Initialize all slots to zero using a const array.
-        let records: Box<[AtomicU64; MAX_PREEMPTION_RECORDS * 4]> = (0..MAX_PREEMPTION_RECORDS * 4)
+        let records: Box<[AtomicU64; MAX_PREEMPTION_RECORDS * RECORD_FIELDS]> = (0
+            ..MAX_PREEMPTION_RECORDS * RECORD_FIELDS)
             .map(|_| AtomicU64::new(0))
             .collect::<Vec<_>>()
             .try_into()
@@ -112,7 +135,14 @@ impl PreemptionRecordStore {
     /// Add a record (signal-safe: uses only atomics).
     ///
     /// Returns the sequence number assigned, or None if the buffer is full.
-    fn push(&self, rbc_count: u64, instruction_pointer: u64, cpu_id: CpuId) -> Option<u64> {
+    pub(crate) fn push(
+        &self,
+        rbc_count: u64,
+        instruction_pointer: u64,
+        cpu_id: CpuId,
+        worker_id: WorkerId,
+        sinfo: StructopInfo,
+    ) -> Option<u64> {
         let idx = self.count.fetch_add(1, SeqCst);
         if idx >= MAX_PREEMPTION_RECORDS {
             // Buffer full, revert and drop.
@@ -120,25 +150,33 @@ impl PreemptionRecordStore {
             return None;
         }
         let seq = self.sequence.fetch_add(1, SeqCst);
-        let base = idx * 4;
+        let base = idx * RECORD_FIELDS;
         self.records[base].store(rbc_count, SeqCst);
         self.records[base + 1].store(instruction_pointer, SeqCst);
         self.records[base + 2].store(cpu_id.0 as u64, SeqCst);
-        self.records[base + 3].store(seq, SeqCst);
+        self.records[base + 3].store(worker_id.0 as u64, SeqCst);
+        self.records[base + 4].store(seq, SeqCst);
+        self.records[base + 5].store(sinfo.cpu_count, SeqCst);
+        self.records[base + 6].store(sinfo.global_count, SeqCst);
+        self.records[base + 7].store(sinfo.rbc_total, SeqCst);
         Some(seq)
     }
 
     /// Retrieve all records (not signal-safe, call after simulation).
-    fn drain(&self) -> Vec<PreemptionRecord> {
+    pub(crate) fn drain(&self) -> Vec<PreemptionRecord> {
         let count = self.count.load(SeqCst).min(MAX_PREEMPTION_RECORDS);
         let mut records = Vec::with_capacity(count);
         for i in 0..count {
-            let base = i * 4;
+            let base = i * RECORD_FIELDS;
             records.push(PreemptionRecord {
                 rbc_count: self.records[base].load(SeqCst),
                 instruction_pointer: self.records[base + 1].load(SeqCst),
                 cpu_id: CpuId(self.records[base + 2].load(SeqCst) as u32),
-                sequence: self.records[base + 3].load(SeqCst),
+                worker_id: WorkerId(self.records[base + 3].load(SeqCst) as usize),
+                sequence: self.records[base + 4].load(SeqCst),
+                structop_local: self.records[base + 5].load(SeqCst),
+                structop_global: self.records[base + 6].load(SeqCst),
+                structop_rbc: self.records[base + 7].load(SeqCst),
             });
         }
         // Sort by sequence number to ensure deterministic ordering.
@@ -692,6 +730,58 @@ pub fn maybe_begin_structop(in_ops: bool) {
     });
 }
 
+/// Reset the per-worker structop counters (call when a worker finishes).
+pub fn reset_structop_cpu_count() {
+    STRUCTOP_CPU_COUNT.with(|c| c.set(0));
+    STRUCTOP_RBC_TOTAL.with(|c| c.set(0));
+    STRUCTOP_KFUNC_COUNT.with(|c| c.set(0));
+    IN_STRUCTOP.with(|c| c.set(false));
+}
+
+/// Reset global structop count (call between dispatch rounds).
+pub fn reset_structop_globals() {
+    STRUCTOP_GLOBAL_COUNT.store(0, SeqCst);
+}
+
+// ---------------------------------------------------------------------------
+// ASLR base detection — .so-relative RIP offsets
+// ---------------------------------------------------------------------------
+
+/// Find the base address of the scheduler .so in the current process.
+///
+/// Parses `/proc/self/maps` looking for the first executable mapping from
+/// a `libscx_*.so` file. Returns 0 if not found. The result can be
+/// subtracted from an absolute RIP to get a .so-relative offset that
+/// survives ASLR.
+pub fn scheduler_so_base() -> u64 {
+    let maps = match std::fs::read_to_string("/proc/self/maps") {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    for line in maps.lines() {
+        // Executable mapping: look for 'r-xp' or 'r--xp' permission field
+        // and a path containing "libscx_"
+        if !line.contains("libscx_") {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        // Check permissions field for executable
+        if !parts[1].contains('x') {
+            continue;
+        }
+        // Parse start address from "start-end"
+        if let Some(start_str) = parts[0].split('-').next() {
+            if let Ok(addr) = u64::from_str_radix(start_str, 16) {
+                return addr;
+            }
+        }
+    }
+    0
+}
+
 // ---------------------------------------------------------------------------
 // PreemptRing — futex-based token ring (signal-safe)
 // ---------------------------------------------------------------------------
@@ -822,10 +912,10 @@ impl PreemptRing {
         self.cooperative_yield_count.load(SeqCst)
     }
 
-    /// Record a PMU preemption point (signal-safe).
+    /// Record a preemption point (signal-safe).
     ///
-    /// Called from the signal handler to capture the RBC count, instruction
-    /// pointer, and CPU ID at the moment of preemption.
+    /// Called from the signal handler or cooperative yield path to capture
+    /// the preemption state including structop context.
     ///
     /// Returns the sequence number assigned, or None if the buffer is full.
     pub fn record_preemption(
@@ -833,17 +923,23 @@ impl PreemptRing {
         rbc_count: u64,
         instruction_pointer: u64,
         cpu_id: CpuId,
+        worker_id: WorkerId,
+        sinfo: StructopInfo,
     ) -> Option<u64> {
-        let seq = self
-            .preemption_records
-            .push(rbc_count, instruction_pointer, cpu_id);
+        let seq =
+            self.preemption_records
+                .push(rbc_count, instruction_pointer, cpu_id, worker_id, sinfo);
         // Also collect to global store for test instrumentation.
         if let Some(s) = seq {
             maybe_collect_global(PreemptionRecord {
                 rbc_count,
                 instruction_pointer,
                 cpu_id,
+                worker_id,
                 sequence: s,
+                structop_local: sinfo.cpu_count,
+                structop_global: sinfo.global_count,
+                structop_rbc: sinfo.rbc_total,
             });
         }
         seq
@@ -1204,7 +1300,15 @@ extern "C" fn preempt_handler(
         sinfo.rbc_total,
         instruction_pointer,
     );
-    ring.record_preemption(rbc_count, instruction_pointer, saved_cpu);
+
+    // 4a. Record the preemption point (with structop context).
+    ring.record_preemption(
+        rbc_count,
+        instruction_pointer,
+        saved_cpu,
+        pctx.worker_id,
+        sinfo,
+    );
 
     // 5. Yield token (futex-based, signal-safe). Blocks until re-selected.
     ring.inc_signal_preempt(); // atomic, signal-safe

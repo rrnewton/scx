@@ -7,7 +7,8 @@ use clap::{Parser, ValueEnum};
 use scx_simulator::scenario::{parse_duration_ns, parse_seed};
 use scx_simulator::{
     compare_checkpoints, discover_schedulers, drain_determinism_checkpoints,
-    enable_determinism_mode, load_rtapp, DynamicScheduler, PreemptiveConfig, SimFormat, Simulator,
+    drain_preemption_records, enable_determinism_mode, enable_preemption_collection, load_rtapp,
+    scheduler_so_base, DynamicScheduler, PreemptionTrace, PreemptiveConfig, SimFormat, Simulator,
     SIM_LOCK,
 };
 
@@ -170,6 +171,14 @@ struct Cli {
     /// is violated.
     #[arg(long)]
     determinism_check: bool,
+
+    /// Record preemption points to a file for later replay.
+    ///
+    /// After the simulation completes, drains all recorded preemption
+    /// points, groups them by worker, and writes a text trace file that
+    /// can be used for deterministic replay.
+    #[arg(long, value_name = "PATH")]
+    record_preemptions: Option<PathBuf>,
 }
 
 fn main() {
@@ -383,6 +392,12 @@ fn print_determinism_failure(
 fn run_simulation(cli: &Cli, scenario: scx_simulator::Scenario) -> Result<(), String> {
     let sched = load_scheduler(&cli.scheduler, cli.cpus)?;
     let _lock = SIM_LOCK.lock().unwrap();
+
+    // Enable preemption recording if --record-preemptions is set.
+    if cli.record_preemptions.is_some() {
+        enable_preemption_collection();
+    }
+
     let trace = Simulator::new(sched).run(scenario);
 
     if cli.dump_trace {
@@ -396,6 +411,25 @@ fn run_simulation(cli: &Cli, scenario: scx_simulator::Scenario) -> Result<(), St
             .write_perfetto_json(&mut file)
             .map_err(|e| format!("failed to write perfetto trace: {e}"))?;
         eprintln!("wrote perfetto trace to {}", path.display());
+    }
+
+    // Record preemption trace if requested.
+    if let Some(path) = &cli.record_preemptions {
+        let records = drain_preemption_records();
+        let num_workers = cli.cpus as usize;
+        let preemption_trace = PreemptionTrace::from_records(&records, num_workers);
+        let so_base = scheduler_so_base();
+
+        let mut file = std::fs::File::create(path)
+            .map_err(|e| format!("failed to create {}: {e}", path.display()))?;
+        preemption_trace
+            .serialize(&mut file, so_base)
+            .map_err(|e| format!("failed to write preemption trace: {e}"))?;
+        eprintln!(
+            "wrote {} preemption records to {}",
+            preemption_trace.len(),
+            path.display()
+        );
     }
 
     if trace.has_error() {
