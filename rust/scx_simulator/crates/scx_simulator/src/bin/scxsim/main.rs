@@ -117,15 +117,17 @@ struct Cli {
     /// Minimum preemptive timeslice in retired conditional branches.
     ///
     /// Controls the lower bound of the random timeslice range used by
-    /// --preemptive mode. Default: 100.
-    #[arg(long, default_value_t = 100, requires = "preemptive")]
+    /// --preemptive mode. Default: 1 (PMU skid means actual preemption
+    /// is tens to hundreds of branches later).
+    #[arg(long, default_value_t = 1, requires = "preemptive")]
     timeslice_min: u64,
 
     /// Maximum preemptive timeslice in retired conditional branches.
     ///
     /// Controls the upper bound of the random timeslice range used by
-    /// --preemptive mode. Default: 1000.
-    #[arg(long, default_value_t = 1000, requires = "preemptive")]
+    /// --preemptive mode. Default: 1 (PMU skid means actual preemption
+    /// is tens to hundreds of branches later).
+    #[arg(long, default_value_t = 1, requires = "preemptive")]
     timeslice_max: u64,
 
     /// List available schedulers and exit.

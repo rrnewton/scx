@@ -586,7 +586,13 @@ pub unsafe fn enter_sim(state: &mut SimulatorState, cpu: CpuId) {
 }
 
 /// Remove the simulator state pointer after ops callbacks complete.
+///
+/// Also pauses the preemption timer — the timer may still be armed from
+/// the last `resume_timer()` inside `with_sim()`. We must disable it
+/// before returning to Rust engine code to prevent PMU signals from
+/// firing outside of C scheduler code.
 pub fn exit_sim() {
+    crate::preempt::pause_timer();
     SIM_STATE.with(|cell| cell.set(None));
 }
 

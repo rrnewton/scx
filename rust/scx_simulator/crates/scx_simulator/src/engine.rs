@@ -9,7 +9,7 @@ use std::ffi::c_void;
 
 use rand::rngs::SmallRng;
 use rand::{RngCore, SeedableRng};
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
 use crate::cgroup::{clear_cgroup_registry, install_cgroup_registry, CgroupId, CgroupRegistry};
 use crate::cpu::{IrqContext, LastStopReason, SimCpu};
@@ -819,9 +819,18 @@ impl<S: Scheduler> Simulator<S> {
 
         // Log interleaving mode
         if let Some(ref cfg) = state.preemptive {
+            if !cfg.cooperative_only {
+                warn!(
+                    timeslice_min = cfg.timeslice_min,
+                    timeslice_max = cfg.timeslice_max,
+                    "preemptive mode: PMU RBC preemption is NONDETERMINISTIC \
+                     (use --record-preemptions / --replay-preemptions for deterministic replay)"
+                );
+            }
             info!(
                 timeslice_min = cfg.timeslice_min,
                 timeslice_max = cfg.timeslice_max,
+                cooperative_only = cfg.cooperative_only,
                 "preemptive interleaving enabled (PMU RBC timer)"
             );
         } else if state.interleave {
@@ -3083,14 +3092,7 @@ impl<S: Scheduler> Simulator<S> {
                 max_cgroups,
                 preemptive_cfg.timeslice_min,
                 preemptive_cfg.timeslice_max,
-                // Force cooperative-only for batch processing: PMU signals
-                // introduce hardware-dependent skid that makes preemption
-                // points non-deterministic, breaking trace reproducibility.
-                // Batch handlers already have cooperative yield points at
-                // every kfunc boundary, providing sufficient interleaving.
-                // PMU-based preemption is reserved for dispatch_concurrent
-                // where the tight C loop has no natural yield points.
-                true,
+                preemptive_cfg.cooperative_only,
             );
         } else {
             Self::process_batch_concurrent_cooperative(

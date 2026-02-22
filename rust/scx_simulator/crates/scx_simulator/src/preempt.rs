@@ -1111,8 +1111,15 @@ extern "C" fn preempt_handler(
         (*sim_ptr).waker_task_raw = saved_waker;
     }
 
-    // 7. Re-arm PMU timer with a fresh timeslice.
-    rearm_timer(ring, &pctx);
+    // 7. Do NOT re-arm the timer here. With small timeslices (e.g. 1 RBC),
+    //    re-arming inside the handler causes a livelock: the timer overflows
+    //    during the handler's own return code, the pending signal fires
+    //    immediately (SIGSTKFLT is blocked during the handler, no SA_NODEFER),
+    //    and the main code never advances.
+    //
+    //    Instead, the timer is re-armed naturally by `with_sim()`'s
+    //    `resume_timer()` when the next kfunc returns to C code. This
+    //    ensures the timer only fires during C scheduler code.
 }
 
 // ---------------------------------------------------------------------------

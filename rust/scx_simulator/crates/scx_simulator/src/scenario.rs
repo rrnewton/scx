@@ -197,6 +197,11 @@ impl NoiseConfig {
 ///
 /// The timeslice (in retired conditional branches) is rolled uniformly
 /// in `[timeslice_min, timeslice_max]` from the interleave PRNG.
+///
+/// The default is min=max=1, requesting the smallest possible timeslice.
+/// In practice, PMU skid means the actual preemption point will be tens
+/// to hundreds of branches after the requested count, so even min=1
+/// produces a useful range of preemption points.
 #[derive(Debug, Clone)]
 pub struct PreemptiveConfig {
     /// Minimum timeslice in retired conditional branches.
@@ -212,8 +217,8 @@ pub struct PreemptiveConfig {
 impl Default for PreemptiveConfig {
     fn default() -> Self {
         PreemptiveConfig {
-            timeslice_min: 100,
-            timeslice_max: 1000,
+            timeslice_min: 1,
+            timeslice_max: 1,
             cooperative_only: false,
         }
     }
