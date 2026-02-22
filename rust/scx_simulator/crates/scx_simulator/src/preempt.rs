@@ -1306,7 +1306,7 @@ extern "C" fn preempt_handler(
     record_rbc_preemption(rbc_count);
     let sinfo = structop_info();
     tracing::trace!(
-        "preempt:rbc structop {}:{} rbc {} rip 0x{:x}",
+        "preempt:pmu structop {}:{} rbc={} rip=0x{:x}",
         sinfo.cpu_count,
         sinfo.global_count,
         sinfo.rbc_total,
@@ -1883,7 +1883,7 @@ extern "C" fn replay_bp_handler(
     record_rbc_preemption(target.rbc_count);
     let sinfo = structop_info();
     tracing::trace!(
-        "preempt:rbc structop {}:{} rbc {} rip 0x{:x}",
+        "preempt:hwbp structop {}:{} rbc={} rip=0x{:x}",
         sinfo.cpu_count,
         sinfo.global_count,
         sinfo.rbc_total,
