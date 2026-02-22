@@ -139,32 +139,58 @@ deviate from kernel semantics. The `<issue>` is a minibeads issue ID (e.g.
 Multi-Agent Team Mode
 ========================================
 
-When you find yourself in a parent directory containing multiple checkouts of
-the same repository (e.g., `<MULTI_SCX>/` with `scx1/`, `scx2/`, `scx3/`, `scx4/`),
-you are in **multi-agent team mode**. This enables parallel development with
-multiple sub-agents working simultaneously.
+When you find yourself in a `work/` directory containing multiple worktrees of
+the same repository (e.g., `<MULTI_SCX>/work/` with `scx1/`, `scx2/`, `scx3/`,
+`scx4/`), you are in **multi-agent team mode**. This enables parallel
+development with multiple sub-agents working simultaneously.
 
-Directory Structure
+Directory Structure (Git Worktrees)
 ----------------------------------------
 
 ```
-<MULTI_SCX>/
-├── scx1/    # Checkout 1 - available for agent work
-├── scx2/    # Checkout 2 - available for agent work
-├── scx3/    # Checkout 3 - available for agent work
-└── scx4/    # Checkout 4 - available for agent work
+<MULTI_SCX>/work/
+├── scx1/    # Primary clone — on simulator.v3
+├── scx2/    # Worktree — on simulator-frida
+├── scx3/    # Worktree — on work/3 (local branch off simulator.v3)
+└── scx4/    # Worktree — on work/4 (local branch off simulator.v3)
 ```
 
-Each checkout is a complete working copy. Sub-agents can work in different
-checkouts simultaneously without conflicts. At the end of each session try 
-to keep all checkouts in sync, all with the same working branches at the same
-tip commits.
+All four directories share a **single `.git` object store** (in scx1). A commit
+in any worktree is immediately visible from all others. `git fetch` in any
+worktree updates all of them.
+
+**Branch constraint:** Git worktrees require each to be on a different branch.
+The two primary branches are `simulator.v3` and `simulator-frida`. The `work/*`
+branches are lightweight local branches for parallel agent work.
+
+Work Branches (`work/*`)
+----------------------------------------
+
+**`work/*` branches are LOCAL ONLY.** Never push them to remote. They exist
+solely to satisfy the worktree one-branch-per-directory constraint.
+
+When work on a `work/*` branch is ready, merge it back to the target branch
+using a **fast-forward only merge**:
+
+```bash
+# From scx1 (on simulator.v3):
+git merge --ff-only work/3
+```
+
+If fast-forward is not possible, rebase the work branch first:
+
+```bash
+# From scx3 (on work/3):
+git rebase simulator.v3
+# Then from scx1:
+git merge --ff-only work/3
+```
 
 Parallel Development Philosophy
 ----------------------------------------
 
-1. **Commit and push early and often** to the same branch. Don't let work
-   accumulate locally — push as soon as `./validate.sh` passes.
+1. **Commit and push early and often** to the real branches (not `work/*`).
+   Don't let work accumulate locally — push as soon as `./validate.sh` passes.
 
 2. **Resolve conflicts early**. When multiple agents push to the same branch,
    the lead agent should pull, rebase, resolve conflicts, and push promptly.
@@ -172,7 +198,7 @@ Parallel Development Philosophy
 3. **Keep tests passing**. Every commit must pass `./validate.sh` locally.
    Check CI status with `with-proxy gh run list` and fix failures immediately.
 
-4. **Stay on the same branch** unless explicitly asked to create a feature
+4. **Stay on the assigned branch** unless explicitly asked to create a feature
    branch for speculative work.
 
 Spawning Sub-Agents
@@ -180,12 +206,12 @@ Spawning Sub-Agents
 
 When spawning a sub-agent to work on a task:
 
-1. **Always specify which checkout directory** the agent should use:
+1. **Always specify which worktree directory** the agent should use:
    ```
-   You are working on the scx_simulator project in <MULTI_SCX>/scx2/rust/scx_simulator
+   You are working on the scx_simulator project in <MULTI_SCX>/work/scx2/rust/scx_simulator
    ```
 
-2. **Assign different checkouts** to parallel tasks to avoid conflicts.
+2. **Assign different worktrees** to parallel tasks to avoid conflicts.
 
 3. **Include clear instructions** about pulling latest, running validation,
    committing, and pushing.
@@ -195,15 +221,33 @@ After Sub-Agent Completion
 
 When sub-agents complete their work:
 
-1. **Check for conflicts**: If multiple agents pushed, rebase and resolve.
+1. **Merge work branches back**: If the agent worked on `work/3` or `work/4`,
+   fast-forward merge the results back to the target branch (e.g. `simulator.v3`).
 
-2. **Sync all checkouts**: Pull the merged state to all working copies:
+2. **Push the real branch**: Push `simulator.v3` or `simulator-frida` to remote.
+
+3. **Reset work branches**: After merging, reset the work branch to the new tip:
    ```bash
-   for d in scx1 scx2 scx3 scx4; do
-     cd /path/to/multi_scx/$d && git fetch origin && git reset --hard origin/<branch>
-   done
+   # From scx3 (on work/3):
+   git reset --hard simulator.v3
    ```
 
-3. **Close issues**: Use `mb close sim-XXXXX` for completed work.
+4. **Close issues**: Use `mb close sim-XXXXX` for completed work.
 
-4. **Verify CI**: Check that the merged changes pass CI.
+5. **Verify CI**: Check that the merged changes pass CI.
+
+Worktree Management
+----------------------------------------
+
+```bash
+# List all worktrees:
+git worktree list
+
+# Switching a worktree to a different real branch (e.g. move scx3 to simulator-frida):
+cd <MULTI_SCX>/work/scx3
+git checkout -b work/3-new simulator-frida   # or any new local branch
+git branch -D work/3                          # delete old
+
+# Adding a new worktree:
+git worktree add ../scx5 -b work/5 simulator.v3
+```
