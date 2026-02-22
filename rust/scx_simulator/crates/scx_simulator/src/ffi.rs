@@ -277,6 +277,14 @@ pub trait Scheduler {
     /// # Safety
     /// Calls into C code.
     unsafe fn cpu_offline(&self, _cpu: i32) {}
+
+    /// Return the `.text` section base address and size of the loaded scheduler.
+    ///
+    /// Used by Frida Stalker to restrict instrumentation to scheduler code only.
+    /// Returns `None` by default (no `.so` to inspect).
+    fn text_range(&self) -> Option<(usize, usize)> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -426,6 +434,8 @@ pub struct DynamicScheduler {
     /// Keep the library alive so function pointers remain valid.
     _lib: libloading::Library,
     ops: SchedOps,
+    /// Path to the loaded `.so` file (needed for Frida stalker text range discovery).
+    so_path: String,
 }
 
 impl DynamicScheduler {
@@ -439,6 +449,12 @@ impl DynamicScheduler {
     pub unsafe fn get_symbol<T>(&self, name: &[u8]) -> Option<libloading::Symbol<'_, T>> {
         self._lib.get(name).ok()
     }
+
+    /// Path to the loaded `.so` file.
+    pub fn so_path(&self) -> &str {
+        &self.so_path
+    }
+
     /// Load a scheduler from a `.so` file.
     ///
     /// - `path`: path to the `.so` file
@@ -464,7 +480,11 @@ impl DynamicScheduler {
         }
 
         let ops = unsafe { Self::load_ops(&lib, prefix) };
-        Self { _lib: lib, ops }
+        Self {
+            _lib: lib,
+            ops,
+            so_path: path.to_owned(),
+        }
     }
 
     /// Load the scx_simple scheduler.
@@ -949,5 +969,15 @@ impl Scheduler for DynamicScheduler {
         if let Some(f) = self.ops.cpu_offline {
             f(cpu);
         }
+    }
+
+    #[cfg(feature = "frida")]
+    fn text_range(&self) -> Option<(usize, usize)> {
+        crate::stalker::discover_so_text_range(&self.so_path).map(|r| (r.base, r.size))
+    }
+
+    #[cfg(not(feature = "frida"))]
+    fn text_range(&self) -> Option<(usize, usize)> {
+        None
     }
 }

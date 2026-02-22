@@ -207,6 +207,10 @@ pub struct PreemptiveConfig {
     /// boundaries. This ensures deterministic interleaving regardless of
     /// hardware behavior. Default: false (use PMU when available).
     pub cooperative_only: bool,
+    /// If true, use Frida Stalker software RBC instead of PMU hardware
+    /// counters. Works in VMs/containers and provides exact branch counts.
+    /// Requires the `frida` feature. Default: false.
+    pub use_frida: bool,
 }
 
 impl Default for PreemptiveConfig {
@@ -215,6 +219,7 @@ impl Default for PreemptiveConfig {
             timeslice_min: 100,
             timeslice_max: 1000,
             cooperative_only: false,
+            use_frida: false,
         }
     }
 }

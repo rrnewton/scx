@@ -114,18 +114,28 @@ struct Cli {
     #[arg(long)]
     preemptive: bool,
 
+    /// Use Frida Stalker software RBC instead of PMU hardware counters.
+    ///
+    /// Instruments the scheduler .so with Frida's dynamic binary translator
+    /// to count conditional branches in software. No PMU needed — works in
+    /// VMs and containers. Implies --preemptive --interleave.
+    ///
+    /// Requires compilation with: cargo build --features frida
+    #[arg(long)]
+    frida: bool,
+
     /// Minimum preemptive timeslice in retired conditional branches.
     ///
     /// Controls the lower bound of the random timeslice range used by
     /// --preemptive mode. Default: 100.
-    #[arg(long, default_value_t = 100, requires = "preemptive")]
+    #[arg(long, default_value_t = 100)]
     timeslice_min: u64,
 
     /// Maximum preemptive timeslice in retired conditional branches.
     ///
     /// Controls the upper bound of the random timeslice range used by
     /// --preemptive mode. Default: 1000.
-    #[arg(long, default_value_t = 1000, requires = "preemptive")]
+    #[arg(long, default_value_t = 1000)]
     timeslice_max: u64,
 
     /// List available schedulers and exit.
@@ -219,8 +229,24 @@ fn run(cli: &Cli) -> Result<(), String> {
             timeslice_min: cli.timeslice_min,
             timeslice_max: cli.timeslice_max,
             cooperative_only: false,
+            use_frida: false,
         });
         scenario.interleave = true;
+    }
+    if cli.frida {
+        #[cfg(not(feature = "frida"))]
+        return Err("--frida requires the frida feature: cargo build --features frida".into());
+
+        #[cfg(feature = "frida")]
+        {
+            scenario.preemptive = Some(PreemptiveConfig {
+                timeslice_min: cli.timeslice_min,
+                timeslice_max: cli.timeslice_max,
+                cooperative_only: false,
+                use_frida: true,
+            });
+            scenario.interleave = true;
+        }
     }
     if let Some(ref end_time) = cli.end_time {
         scenario.duration_ns =
@@ -259,6 +285,37 @@ fn run(cli: &Cli) -> Result<(), String> {
         if cli.real_run != RealRunMode::Off {
             return Err("--determinism-check conflicts with --real-run".into());
         }
+
+        // When the `frida` feature is compiled in, automatically enable
+        // preemptive interleaving for determinism checks. The engine will
+        // route to the Frida Stalker path instead of PMU hardware counters,
+        // providing exact branch counts without PMU skid.
+        #[cfg(feature = "frida")]
+        if scenario.preemptive.is_none() {
+            eprintln!(
+                "Frida feature enabled: auto-enabling preemptive interleaving \
+                 (software RBC via Stalker)"
+            );
+            scenario.preemptive = Some(PreemptiveConfig {
+                timeslice_min: cli.timeslice_min,
+                timeslice_max: cli.timeslice_max,
+                cooperative_only: false,
+                use_frida: true,
+            });
+            scenario.interleave = true;
+        }
+
+        // Warn when frida is not compiled in: determinism-check will use
+        // PMU hardware counters which have skid and are not perfectly
+        // deterministic. Compile with --features frida for exact counts.
+        #[cfg(not(feature = "frida"))]
+        eprintln!(
+            "WARNING: frida feature not compiled in. --determinism-check will \
+             use PMU hardware counters (subject to skid) or cooperative-only \
+             interleaving. For perfectly deterministic preemption, rebuild \
+             with: cargo build --features frida"
+        );
+
         return run_determinism_check(cli, scenario);
     }
 
@@ -277,6 +334,24 @@ fn run(cli: &Cli) -> Result<(), String> {
 
 fn run_determinism_check(cli: &Cli, scenario: scx_simulator::Scenario) -> Result<(), String> {
     let _lock = SIM_LOCK.lock().unwrap();
+
+    // Log the interleaving mode being used for determinism checking.
+    #[cfg(feature = "frida")]
+    if scenario.preemptive.is_some() {
+        eprintln!(
+            "Determinism check: using Frida Stalker software RBC \
+             (timeslice {}-{})",
+            cli.timeslice_min, cli.timeslice_max
+        );
+    }
+    #[cfg(not(feature = "frida"))]
+    if scenario.preemptive.is_some() {
+        eprintln!(
+            "Determinism check: using PMU hardware RBC \
+             (timeslice {}-{})",
+            cli.timeslice_min, cli.timeslice_max
+        );
+    }
 
     // Run 1: collect checkpoints
     enable_determinism_mode();

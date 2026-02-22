@@ -843,22 +843,25 @@ impl PreemptRing {
 // ---------------------------------------------------------------------------
 
 /// Thread-local context for a worker participating in preemptive interleaving.
+///
+/// `pub(crate)` so that `stalker::do_software_yield` can access the ring,
+/// worker ID, and timeslice range directly for Frida-based preemption.
 #[derive(Clone, Copy)]
-struct PreemptCtx {
-    ring: *const PreemptRing,
-    worker_id: WorkerId,
+pub(crate) struct PreemptCtx {
+    pub(crate) ring: *const PreemptRing,
+    pub(crate) worker_id: WorkerId,
     /// Raw fd of the RBC timer (for disable/enable in signal handler).
-    timer_fd: RawFd,
+    pub(crate) timer_fd: RawFd,
     /// Timeslice range for re-arming the timer after preemption.
-    timeslice_min: u64,
-    timeslice_max: u64,
+    pub(crate) timeslice_min: u64,
+    pub(crate) timeslice_max: u64,
 }
 
 // Raw pointer is Send — access serialized by token passing.
 unsafe impl Send for PreemptCtx {}
 
 thread_local! {
-    static PREEMPT_CTX: Cell<Option<PreemptCtx>> = const { Cell::new(None) };
+    pub(crate) static PREEMPT_CTX: Cell<Option<PreemptCtx>> = const { Cell::new(None) };
 }
 
 /// Install preemptive interleave context on the current worker thread.
@@ -962,6 +965,10 @@ pub fn maybe_yield_preemptive() {
 ///
 /// **Async-signal-safe**: uses only a thread-local read and an ioctl.
 pub fn pause_timer() {
+    #[cfg(feature = "frida")]
+    if crate::stalker::is_frida_active() {
+        return;
+    }
     if let Some(ctx) = PREEMPT_CTX.with(|c| c.get()) {
         disable_timer(ctx.timer_fd);
     }
@@ -973,6 +980,10 @@ pub fn pause_timer() {
 /// Re-arms the PMU timer with a fresh random timeslice. No-op if
 /// preemptive interleaving is not active on this thread.
 pub fn resume_timer() {
+    #[cfg(feature = "frida")]
+    if crate::stalker::is_frida_active() {
+        return;
+    }
     if let Some(ctx) = PREEMPT_CTX.with(|c| c.get()) {
         let ring = unsafe { &*ctx.ring };
         rearm_timer(ring, &ctx);

@@ -52,6 +52,9 @@ pub mod trace;
 pub mod types;
 pub mod workloads;
 
+#[cfg(feature = "frida")]
+pub mod stalker;
+
 // Re-export the main public types for convenience.
 pub use bpf_trace::{
     BpfEventKind, BpfTrace, BpfTraceEvent, TraceComparisonResult, TraceDifferences,
