@@ -1,12 +1,27 @@
 //! Compact formatting helpers for trace output.
+//!
+//! Provides [`SimLayer`], a custom tracing subscriber layer that formats events
+//! showing simulator virtual time instead of wall-clock time. Unlike the default
+//! `tracing_subscriber::fmt` layer, `SimLayer` does NOT reuse a thread-local
+//! `String` buffer between events. Instead, each event is formatted into a
+//! freshly-allocated `String` and written to stderr via a single `libc::write()`
+//! syscall.
+//!
+//! This avoids a corruption issue under Frida Stalker dynamic binary
+//! instrumentation: Stalker's JIT code cache writes stale pointers (8 bytes)
+//! into the beginning of the reused thread-local format buffer, producing
+//! garbage bytes in log output at preemption points.
 
 use std::fmt;
+use std::fmt::Write as _;
 
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
+use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::Layer;
 
 use crate::kfuncs::{sim_clock, sim_cpu, sim_cpu_width};
 use crate::types::{CpuId, TimeNs};
@@ -204,6 +219,111 @@ impl Visit for FieldCollector {
     fn record_bool(&mut self, field: &Field, value: bool) {
         self.fields
             .push((field.name().to_string(), value.to_string()));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SimLayer — Stalker-safe tracing layer
+// ---------------------------------------------------------------------------
+
+/// Tracing layer that formats events with simulator virtual time and writes
+/// to stderr via raw `libc::write()`, avoiding the thread-local buffer reuse
+/// pattern in `tracing_subscriber::fmt` that gets corrupted under Frida Stalker.
+///
+/// Each event is formatted into a freshly-allocated `String`. The formatted
+/// bytes are then written to fd 2 in a single `write()` syscall, guaranteeing
+/// atomic output for lines under `PIPE_BUF` (4096 bytes).
+///
+/// ANSI color codes are enabled when stderr is a terminal.
+pub struct SimLayer {
+    ansi: bool,
+}
+
+impl Default for SimLayer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SimLayer {
+    /// Create a new `SimLayer`.
+    ///
+    /// ANSI color output is enabled when stderr is a terminal (detected via
+    /// `libc::isatty`).
+    pub fn new() -> Self {
+        let ansi = unsafe { libc::isatty(2) != 0 };
+        Self { ansi }
+    }
+
+    /// Format a single event into the provided `String` buffer.
+    fn format_event_to_buf(&self, buf: &mut String, event: &Event<'_>) {
+        let clock = sim_clock();
+        let cpu = sim_cpu();
+        let width = sim_cpu_width();
+
+        // Timestamp
+        let _ = write!(buf, "[{}] ", FmtTs::local(clock, cpu, width));
+
+        // Level with optional ANSI color
+        let level = *event.metadata().level();
+        if self.ansi {
+            let color = match level {
+                Level::ERROR => "\x1b[31m",
+                Level::WARN => "\x1b[33m",
+                Level::INFO => "\x1b[32m",
+                Level::DEBUG => "\x1b[34m",
+                Level::TRACE => "\x1b[35m",
+            };
+            let _ = write!(buf, "{color}{level:>5}\x1b[0m ");
+        } else {
+            let _ = write!(buf, "{level:>5} ");
+        }
+
+        // Collect fields and message
+        let mut visitor = FieldCollector::default();
+        event.record(&mut visitor);
+
+        // Message first, then fields
+        let _ = write!(buf, "{}", visitor.message);
+        for (key, value) in &visitor.fields {
+            let _ = write!(buf, " {key}={value}");
+        }
+        buf.push('\n');
+    }
+
+    /// Write bytes to stderr via a raw `libc::write()` syscall.
+    ///
+    /// Bypasses Rust's `io::Stderr` locking, which interacts poorly with
+    /// Stalker-translated code. A single `write(2, ...)` is atomic for
+    /// payloads under `PIPE_BUF` (4096 bytes on Linux).
+    fn write_stderr(data: &[u8]) {
+        let mut written = 0;
+        while written < data.len() {
+            let ret = unsafe {
+                libc::write(
+                    2,
+                    data[written..].as_ptr() as *const libc::c_void,
+                    data.len() - written,
+                )
+            };
+            if ret < 0 {
+                break; // I/O error, give up
+            }
+            written += ret as usize;
+        }
+    }
+}
+
+impl<S> Layer<S> for SimLayer
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        // Allocate a fresh String for each event to avoid the thread-local
+        // buffer reuse that gets corrupted under Frida Stalker DBI.
+        let mut buf = String::with_capacity(128);
+        self.format_event_to_buf(&mut buf, event);
+        Self::write_stderr(buf.as_bytes());
     }
 }
 

@@ -65,7 +65,7 @@ pub use cgroup::{
 };
 pub use engine::{ExitKind, SimulationResult, Simulator};
 pub use ffi::{discover_schedulers, DynamicScheduler, LavdPowerMode, Scheduler, SchedulerInfo};
-pub use fmt::{FmtN, FmtTs, SimFormat};
+pub use fmt::{FmtN, FmtTs, SimFormat, SimLayer};
 pub use kfuncs::sim_clock;
 pub use monitor::{Monitor, ProbeContext, ProbePoint};
 pub use perf::RbcCounter;

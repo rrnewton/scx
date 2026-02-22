@@ -1,6 +1,6 @@
 use std::sync::MutexGuard;
 
-use scx_simulator::{SimFormat, SIM_LOCK};
+use scx_simulator::{SimLayer, SIM_LOCK};
 
 /// Acquire the simulator lock and initialize tracing from `RUST_LOG`.
 ///
@@ -18,9 +18,11 @@ pub fn setup_test() -> MutexGuard<'static, ()> {
         // Clear the poison and recover.
         poisoned.into_inner()
     });
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .event_format(SimFormat)
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    let _ = tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .with(SimLayer::new())
         .try_init();
     guard
 }

@@ -7,7 +7,7 @@ use clap::{Parser, ValueEnum};
 use scx_simulator::scenario::{parse_duration_ns, parse_seed};
 use scx_simulator::{
     compare_checkpoints, discover_schedulers, drain_determinism_checkpoints,
-    enable_determinism_mode, load_rtapp, DynamicScheduler, PreemptiveConfig, SimFormat, Simulator,
+    enable_determinism_mode, load_rtapp, DynamicScheduler, PreemptiveConfig, SimLayer, Simulator,
     SIM_LOCK,
 };
 
@@ -503,8 +503,15 @@ fn list_schedulers() {
 }
 
 fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .event_format(SimFormat)
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    // Use SimLayer instead of tracing_subscriber::fmt() to avoid the
+    // thread-local String buffer reuse that gets corrupted under Frida
+    // Stalker DBI. SimLayer formats each event into a fresh allocation
+    // and writes to stderr via a raw write() syscall.
+    let _ = tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .with(SimLayer::new())
         .try_init();
 }
