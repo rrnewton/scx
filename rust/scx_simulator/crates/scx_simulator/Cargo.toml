@@ -14,7 +14,7 @@ scx_perf = { path = "../scx_perf" }
 serde_json = { version = "1", features = ["preserve_order"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-frida-gum = { version = "0.17", optional = true, features = ["auto-download", "event-sink"] }
+frida-gum = { version = "0.17.1", optional = true, features = ["auto-download", "event-sink"] }
 
 [features]
 default = []
