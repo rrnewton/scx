@@ -494,14 +494,24 @@ impl SimulatorState {
         // Hash ALL DSQ contents in sorted order (not just GLOBAL).
         // Schedulers create custom DSQs (e.g., tickless uses SHARED_DSQ=0)
         // that must be included for complete state comparison.
+        //
+        // Includes DSQ mode (FIFO vs PRIQ) and vtimes for vtime-ordered
+        // entries, ensuring that two runs with identical PIDs but different
+        // vtime assignments produce different hashes.
         let dsq_ids = self.dsqs.sorted_dsq_ids();
         hash = fnv1a_combine(hash, fnv1a_hash_u64(dsq_ids.len() as u64));
         for dsq_id in dsq_ids {
             hash = fnv1a_combine(hash, fnv1a_hash_u64(dsq_id.0));
-            let pids = self.dsqs.ordered_pids(dsq_id);
-            hash = fnv1a_combine(hash, fnv1a_hash_u64(pids.len() as u64));
-            for pid in pids {
+            // Include DSQ mode in hash (empty=0, fifo=1, priq=2)
+            hash = fnv1a_combine(hash, fnv1a_hash_u64(self.dsqs.mode_tag(dsq_id) as u64));
+            let entries = self.dsqs.ordered_entries(dsq_id);
+            hash = fnv1a_combine(hash, fnv1a_hash_u64(entries.len() as u64));
+            for (pid, vtime) in entries {
                 hash = fnv1a_combine(hash, fnv1a_hash_u64(pid.0 as u64));
+                // Hash vtime when present (vtime-ordered DSQs)
+                if let Some(vt) = vtime {
+                    hash = fnv1a_combine(hash, fnv1a_hash_u64(vt.0));
+                }
             }
         }
 

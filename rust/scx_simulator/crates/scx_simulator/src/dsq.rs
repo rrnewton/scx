@@ -115,6 +115,32 @@ impl Dsq {
         }
     }
 
+    /// Return all entries in priority order with optional vtimes.
+    ///
+    /// For vtime-ordered DSQs, returns `(pid, Some(vtime))` pairs.
+    /// For FIFO DSQs, returns `(pid, None)` pairs.
+    /// Used by `compute_state_hash` for stricter memory hashing.
+    pub fn ordered_entries(&self) -> Vec<(Pid, Option<Vtime>)> {
+        match self.mode {
+            DsqMode::Priq => self
+                .vtime_entries
+                .iter()
+                .map(|(&(vtime, _), &pid)| (pid, Some(vtime)))
+                .collect(),
+            DsqMode::Fifo => self.fifo_entries.iter().map(|&pid| (pid, None)).collect(),
+            DsqMode::Empty => Vec::new(),
+        }
+    }
+
+    /// Return a numeric tag for the DSQ mode, used for state hashing.
+    pub fn mode_tag(&self) -> u8 {
+        match self.mode {
+            DsqMode::Empty => 0,
+            DsqMode::Fifo => 1,
+            DsqMode::Priq => 2,
+        }
+    }
+
     /// Remove a specific PID from the queue. Returns true if found.
     /// Resets mode to Empty when the last task is removed.
     pub fn remove_pid(&mut self, pid: Pid) -> bool {
@@ -213,6 +239,18 @@ impl DsqManager {
         self.dsqs
             .get(&dsq_id)
             .map_or_else(Vec::new, |dsq| dsq.ordered_pids())
+    }
+
+    /// Get ordered entries with vtimes in a DSQ for state hashing.
+    pub fn ordered_entries(&self, dsq_id: DsqId) -> Vec<(Pid, Option<Vtime>)> {
+        self.dsqs
+            .get(&dsq_id)
+            .map_or_else(Vec::new, |dsq| dsq.ordered_entries())
+    }
+
+    /// Get the mode tag of a DSQ for state hashing.
+    pub fn mode_tag(&self, dsq_id: DsqId) -> u8 {
+        self.dsqs.get(&dsq_id).map_or(0, |dsq| dsq.mode_tag())
     }
 
     /// Remove a specific PID from a DSQ. Returns true if found.
