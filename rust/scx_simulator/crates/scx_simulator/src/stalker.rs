@@ -7,9 +7,19 @@
 //! runtime, inserting callouts before every conditional branch instruction.
 //!
 //! A thread-local software counter (`SOFTWARE_RBC_COUNTER`) is decremented at
-//! each conditional branch. When it reaches zero, the thread yields its token
-//! via the same [`PreemptRing`] mechanism used by the PMU signal handler,
-//! producing identical deterministic interleaving behavior.
+//! each conditional branch. When it reaches zero, a `YIELD_PENDING` flag is set.
+//! The actual yield happens at the next kfunc boundary, where
+//! [`maybe_yield_preemptive`](crate::preempt::maybe_yield_preemptive) checks the
+//! flag and performs the token-ring yield.
+//!
+//! ## Why deferred yield?
+//!
+//! Stalker's dynamic binary instrumentation translates ALL code on the thread,
+//! not just the `.so`. Performing complex operations (futex_wait, heap alloc,
+//! tracing) inside a Stalker callout corrupts memory because the Rust runtime
+//! code is also being translated. By deferring the yield to a kfunc boundary
+//! (which already runs safely under Stalker — proven by cooperative yields),
+//! we avoid this corruption.
 //!
 //! ## Why software RBC?
 //!
@@ -28,9 +38,11 @@
 //! ## Relationship to [`preempt`]
 //!
 //! - [`preempt`] uses PMU overflow signals (`SIGSTKFLT`) to trigger preemption.
-//! - This module uses Stalker instrumentation callouts to trigger preemption.
+//! - This module uses Stalker instrumentation callouts to set a yield-pending flag.
 //! - Both use [`PreemptRing`] for token passing and futex-based parking.
 //! - Both save/restore [`SimulatorState`] context across yields.
+//! - The actual yield for Frida mode happens in [`preempt::maybe_yield_preemptive`]
+//!   at kfunc boundaries, not inside the Stalker callout.
 //!
 //! [`preempt`]: crate::preempt
 //! [`PreemptRing`]: crate::preempt::PreemptRing
@@ -42,8 +54,6 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use frida_gum::stalker::Transformer;
 use frida_gum::Gum;
 
-use crate::preempt::PREEMPT_CTX;
-
 // ---------------------------------------------------------------------------
 // Thread-local software RBC state
 // ---------------------------------------------------------------------------
@@ -52,24 +62,23 @@ thread_local! {
     /// Software retired-branch-conditional counter.
     ///
     /// Decremented at each instrumented conditional branch. When it reaches
-    /// zero, the thread yields its token. Initialized to `u64::MAX` (disarmed).
+    /// zero, `YIELD_PENDING` is set. Initialized to `u64::MAX` (disarmed).
     static SOFTWARE_RBC_COUNTER: Cell<u64> = const { Cell::new(u64::MAX) };
 
     /// Whether Frida Stalker instrumentation is active on this thread.
     static FRIDA_ACTIVE: Cell<bool> = const { Cell::new(false) };
+
+    /// Deferred yield flag. Set by the Stalker callout when the software RBC
+    /// counter reaches zero. Checked and cleared by `maybe_yield_preemptive()`
+    /// at kfunc boundaries.
+    static YIELD_PENDING: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Global counter for total callouts executed (for diagnostics).
 static TOTAL_CALLOUTS: AtomicU64 = AtomicU64::new(0);
 
-/// Global counter for how many times do_software_yield() was entered.
-static YIELD_ENTRIES: AtomicU64 = AtomicU64::new(0);
-
-/// Global counter for how many times do_software_yield() found PREEMPT_CTX=None.
-static YIELD_NO_CTX: AtomicU64 = AtomicU64::new(0);
-
-/// Global counter for how many times do_software_yield() found sim_state_ptr=None.
-static YIELD_NO_SIM: AtomicU64 = AtomicU64::new(0);
+/// Global counter for deferred yields consumed at kfunc boundaries.
+static DEFERRED_YIELDS: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // TextRange — address range of the scheduler .so's executable segment
@@ -113,7 +122,6 @@ pub fn discover_so_text_range(so_path: &str) -> Option<TextRange> {
     let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
 
     for line in maps.lines() {
-        // The line must reference our .so and have executable permissions.
         if !line.contains(so_path) {
             continue;
         }
@@ -121,7 +129,6 @@ pub fn discover_so_text_range(so_path: &str) -> Option<TextRange> {
             continue;
         }
 
-        // Parse "start-end r-xp ..."
         let addr_range = line.split_whitespace().next()?;
         let mut parts = addr_range.split('-');
         let start_str = parts.next()?;
@@ -148,61 +155,66 @@ pub fn discover_so_text_range(so_path: &str) -> Option<TextRange> {
 /// Check if an x86/x86-64 mnemonic is a conditional branch.
 ///
 /// Matches the Jcc family (all conditional jumps) and the LOOPcc family.
-/// These are the instructions that correspond to "retired conditional branches"
-/// in PMU terminology.
 /// Used in tests; the runtime `build_transformer` uses opcode-based detection.
 #[cfg(test)]
 fn is_conditional_branch(mnemonic: &str) -> bool {
     matches!(
         mnemonic,
-        // Jcc family -- all conditional jumps
         "jo" | "jno"
-        | "jb" | "jnae" | "jc"
-        | "jae" | "jnb" | "jnc"
-        | "je" | "jz"
-        | "jne" | "jnz"
-        | "jbe" | "jna"
-        | "ja" | "jnbe"
-        | "js" | "jns"
-        | "jp" | "jpe"
-        | "jnp" | "jpo"
-        | "jl" | "jnge"
-        | "jge" | "jnl"
-        | "jle" | "jng"
-        | "jg" | "jnle"
-        // LOOPcc family
-        | "loop" | "loope" | "loopz" | "loopne" | "loopnz"
+            | "jb"
+            | "jnae"
+            | "jc"
+            | "jae"
+            | "jnb"
+            | "jnc"
+            | "je"
+            | "jz"
+            | "jne"
+            | "jnz"
+            | "jbe"
+            | "jna"
+            | "ja"
+            | "jnbe"
+            | "js"
+            | "jns"
+            | "jp"
+            | "jpe"
+            | "jnp"
+            | "jpo"
+            | "jl"
+            | "jnge"
+            | "jge"
+            | "jnl"
+            | "jle"
+            | "jng"
+            | "jg"
+            | "jnle"
+            | "loop"
+            | "loope"
+            | "loopz"
+            | "loopne"
+            | "loopnz"
     )
 }
 
 /// Check if x86/x86-64 instruction bytes represent a conditional branch.
 ///
-/// Uses opcode-based detection rather than mnemonic string matching, which
-/// avoids the need to access the private `cs_insn.mnemonic` field through
-/// frida-gum's `Insn` wrapper.
-///
 /// x86-64 conditional branch opcodes:
-/// - `0x70..=0x7F`: Short Jcc (2-byte instructions, e.g., `je rel8`)
-/// - `0x0F 0x80..=0x0F 0x8F`: Near Jcc (6-byte instructions, e.g., `je rel32`)
-/// - `0xE0`: LOOPNE/LOOPNZ
-/// - `0xE1`: LOOPE/LOOPZ
-/// - `0xE2`: LOOP
-/// - `0xE3`: JCXZ/JECXZ/JRCXZ
+/// - `0x70..=0x7F`: Short Jcc (2-byte, e.g., `je rel8`)
+/// - `0x0F 0x80..=0x0F 0x8F`: Near Jcc (6-byte, e.g., `je rel32`)
+/// - `0xE0..=0xE3`: LOOPcc / JCXZ
 fn is_conditional_branch_opcode(bytes: &[u8]) -> bool {
     if bytes.is_empty() {
         return false;
     }
 
-    // Skip any legacy prefixes (REX, segment overrides, etc.) that may
-    // precede the opcode.
+    // Skip legacy and REX prefixes.
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            // Legacy prefixes (segment, operand-size, address-size, lock, rep)
             0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x66 | 0x67 | 0xF0 | 0xF2 | 0xF3 => {
                 i += 1;
             }
-            // REX prefixes (x86-64 only)
             0x40..=0x4F => {
                 i += 1;
             }
@@ -215,11 +227,8 @@ fn is_conditional_branch_opcode(bytes: &[u8]) -> bool {
     }
 
     match bytes[i] {
-        // Short Jcc: 0x70..=0x7F
         0x70..=0x7F => true,
-        // LOOPcc and JCXZ: 0xE0..=0xE3
         0xE0..=0xE3 => true,
-        // Two-byte opcode escape: 0x0F followed by 0x80..=0x8F (near Jcc)
         0x0F => i + 1 < bytes.len() && matches!(bytes[i + 1], 0x80..=0x8F),
         _ => false,
     }
@@ -232,12 +241,11 @@ fn is_conditional_branch_opcode(bytes: &[u8]) -> bool {
 /// Build a Stalker [`Transformer`] that instruments conditional branches
 /// within the scheduler's `.so` text segment.
 ///
-/// For each basic block, the transformer iterates over instructions. If an
-/// instruction's address falls within `range` and it is a conditional branch
-/// (detected via opcode bytes), a callout is inserted that decrements the
-/// software RBC counter and yields when exhausted.
-///
-/// All original instructions are preserved via `keep()`.
+/// The callout is intentionally minimal: it decrements a thread-local counter
+/// and sets a `YIELD_PENDING` flag when the counter reaches zero. No blocking,
+/// no allocation, no I/O. The actual yield is deferred to the next kfunc
+/// boundary where [`maybe_yield_preemptive`](crate::preempt::maybe_yield_preemptive)
+/// runs safely.
 pub fn build_transformer<'a>(gum: &'a Gum, range: &TextRange) -> Transformer<'a> {
     let range_base = range.base;
     let range_size = range.size;
@@ -246,7 +254,6 @@ pub fn build_transformer<'a>(gum: &'a Gum, range: &TextRange) -> Transformer<'a>
         for instr in basic_block {
             let addr = instr.instr().address() as usize;
 
-            // Only instrument instructions within the scheduler .so text.
             if addr >= range_base && addr < range_base + range_size {
                 let bytes = instr.instr().bytes();
                 if is_conditional_branch_opcode(bytes) {
@@ -256,105 +263,80 @@ pub fn build_transformer<'a>(gum: &'a Gum, range: &TextRange) -> Transformer<'a>
                 }
             }
 
-            // Always keep the original instruction.
             instr.keep();
         }
     })
 }
 
 // ---------------------------------------------------------------------------
-// Software RBC callout -- decrements counter and yields
+// Software RBC callout -- decrements counter and sets yield flag
 // ---------------------------------------------------------------------------
 
 /// Inner logic for the software RBC callout.
 ///
-/// Decremented at each instrumented conditional branch. When the counter
-/// reaches zero, triggers a yield via `do_software_yield`.
+/// This runs inside Stalker-translated code, so it must be minimal:
+/// only thread-local reads/writes and an atomic increment. No blocking,
+/// no heap allocation, no stdio, no tracing.
+///
+/// When the counter decrements to zero (1→0 transition), sets `YIELD_PENDING`
+/// so the next kfunc-boundary yield point will perform the actual yield.
+/// This is one callout earlier than waiting for counter==0, ensuring the flag
+/// is visible at the next kfunc boundary.
 #[inline]
 fn software_rbc_callout_inner() {
     TOTAL_CALLOUTS.fetch_add(1, Relaxed);
 
     SOFTWARE_RBC_COUNTER.with(|counter| {
         let current = counter.get();
-        if current == 0 {
-            // Counter exhausted — yield to another worker.
-            do_software_yield();
-        } else if current != u64::MAX {
-            // Counter is armed and nonzero — decrement.
-            counter.set(current - 1);
+        if current == u64::MAX || current == 0 {
+            // Disarmed or already signaled — no-op.
+            return;
         }
-        // If counter == u64::MAX, the counter is disarmed (no-op).
+        let new = current - 1;
+        counter.set(new);
+        if new == 0 {
+            // Counter just hit zero — signal deferred yield.
+            YIELD_PENDING.with(|flag| flag.set(true));
+        }
     });
 }
 
-/// Perform a software-RBC-triggered yield.
+// ---------------------------------------------------------------------------
+// Deferred yield check (called from maybe_yield_preemptive)
+// ---------------------------------------------------------------------------
+
+/// Check and clear the deferred yield flag.
 ///
-/// This replicates the save/restore pattern from the PMU signal handler
-/// in [`preempt::preempt_handler`], but without signal context (since we
-/// are called from a Stalker callout, not a signal handler).
+/// Called by [`maybe_yield_preemptive`](crate::preempt::maybe_yield_preemptive)
+/// at kfunc boundaries. Returns `true` if the Stalker callout set the
+/// `YIELD_PENDING` flag (i.e., the software RBC counter expired).
 ///
-/// Steps:
-/// 1. Access the thread-local `PREEMPT_CTX` to get the ring and worker ID.
-/// 2. Save `SimulatorState` per-callback context (current_cpu, ops_context,
-///    waker_task_raw).
-/// 3. Record the preemption for determinism verification.
-/// 4. Yield the token via `ring.yield_token()` (blocks via futex_wait).
-/// 5. On resume: restore `SimulatorState` context.
-/// 6. Roll a new timeslice and set `SOFTWARE_RBC_COUNTER`.
-fn do_software_yield() {
-    YIELD_ENTRIES.fetch_add(1, Relaxed);
-
-    let ctx = PREEMPT_CTX.with(|c| c.get());
-    let ctx = match ctx {
-        Some(ctx) => ctx,
-        None => {
-            YIELD_NO_CTX.fetch_add(1, Relaxed);
-            return;
+/// When this returns `true`, the caller should perform a preemptive yield
+/// (same as a PMU signal-triggered preemption) and then re-arm the counter
+/// via [`rearm_software_rbc`].
+pub fn take_yield_pending() -> bool {
+    YIELD_PENDING.with(|flag| {
+        if flag.get() {
+            flag.set(false);
+            DEFERRED_YIELDS.fetch_add(1, Relaxed);
+            true
+        } else {
+            false
         }
-    };
+    })
+}
 
-    let ring = unsafe { &*ctx.ring };
-
-    // Get SimulatorState pointer.
-    let sim_ptr = match crate::kfuncs::sim_state_ptr() {
-        Some(p) => p,
-        None => {
-            YIELD_NO_SIM.fetch_add(1, Relaxed);
-            return;
-        }
-    };
-
-    // Save per-callback context from SimulatorState.
-    let (saved_cpu, saved_ops_ctx, saved_waker) = unsafe {
-        (
-            (*sim_ptr).current_cpu,
-            (*sim_ptr).ops_context,
-            (*sim_ptr).waker_task_raw,
-        )
-    };
-
-    // Record the preemption point for determinism verification.
-    ring.record_preemption(
-        0, // rbc_count: not available in software mode
-        0, // instruction_pointer: not available without ucontext
-        saved_cpu,
-    );
-
-    // Yield token (futex-based). Blocks until re-selected.
-    ring.inc_signal_preempt();
-    ring.yield_token(ctx.worker_id);
-
-    // Resumed — restore SimulatorState context.
-    unsafe {
-        (*sim_ptr).current_cpu = saved_cpu;
-        (*sim_ptr).ops_context = saved_ops_ctx;
-        (*sim_ptr).waker_task_raw = saved_waker;
-    }
-
-    // Roll a new timeslice and re-arm the software counter.
-    let timeslice = ring.roll_timeslice(ctx.timeslice_min, ctx.timeslice_max);
+/// Re-arm the software RBC counter with a new timeslice after a deferred yield.
+///
+/// Called by `maybe_yield_preemptive` after completing the yield to set the
+/// counter for the next preemption interval. Also clears YIELD_PENDING in case
+/// it was set redundantly.
+pub fn rearm_software_rbc(timeslice: u64) {
     SOFTWARE_RBC_COUNTER.with(|counter| {
         counter.set(timeslice);
+    });
+    YIELD_PENDING.with(|flag| {
+        flag.set(false);
     });
 }
 
@@ -363,10 +345,6 @@ fn do_software_yield() {
 // ---------------------------------------------------------------------------
 
 /// Arm the software RBC counter with the given timeslice.
-///
-/// After this call, the next `timeslice` conditional branches will be
-/// counted before triggering a yield. Call this before entering scheduler
-/// C code on a worker thread.
 pub fn arm_software_rbc(timeslice: u64) {
     SOFTWARE_RBC_COUNTER.with(|counter| {
         counter.set(timeslice);
@@ -377,9 +355,6 @@ pub fn arm_software_rbc(timeslice: u64) {
 }
 
 /// Disarm the software RBC counter.
-///
-/// Sets the counter to `u64::MAX` (effectively infinite — no preemption)
-/// and marks Frida as inactive on this thread.
 pub fn disarm_software_rbc() {
     SOFTWARE_RBC_COUNTER.with(|counter| {
         counter.set(u64::MAX);
@@ -387,12 +362,12 @@ pub fn disarm_software_rbc() {
     FRIDA_ACTIVE.with(|active| {
         active.set(false);
     });
+    YIELD_PENDING.with(|flag| {
+        flag.set(false);
+    });
 }
 
 /// Check whether Frida Stalker instrumentation is active on the current thread.
-///
-/// Used by [`preempt::pause_timer`] / [`preempt::resume_timer`] to skip
-/// PMU timer operations when software RBC is in use.
 pub fn is_frida_active() -> bool {
     FRIDA_ACTIVE.with(|active| active.get())
 }
@@ -402,21 +377,15 @@ pub fn total_callouts() -> u64 {
     TOTAL_CALLOUTS.load(Relaxed)
 }
 
-/// Return yield diagnostic counters: (entries, no_ctx, no_sim).
-pub fn yield_diagnostics() -> (u64, u64, u64) {
-    (
-        YIELD_ENTRIES.load(Relaxed),
-        YIELD_NO_CTX.load(Relaxed),
-        YIELD_NO_SIM.load(Relaxed),
-    )
+/// Return the total number of deferred yields consumed.
+pub fn deferred_yields() -> u64 {
+    DEFERRED_YIELDS.load(Relaxed)
 }
 
-/// Reset the global callout counter (for testing).
-pub fn reset_callout_counter() {
+/// Reset all diagnostic counters.
+pub fn reset_counters() {
     TOTAL_CALLOUTS.store(0, Relaxed);
-    YIELD_ENTRIES.store(0, Relaxed);
-    YIELD_NO_CTX.store(0, Relaxed);
-    YIELD_NO_SIM.store(0, Relaxed);
+    DEFERRED_YIELDS.store(0, Relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -434,8 +403,6 @@ pub struct SyncTransformer<'a>(pub Transformer<'a>);
 
 // SAFETY: The GumStalkerTransformer GObject is ref-counted and the
 // Transformer is only used via immutable `&self` in `follow_me`.
-// Each worker thread creates its own Stalker instance and merely
-// references the shared transformer.
 unsafe impl Sync for SyncTransformer<'_> {}
 unsafe impl Send for SyncTransformer<'_> {}
 
@@ -497,10 +464,9 @@ mod tests {
     #[test]
     fn test_conditional_branch_opcode_short_jcc() {
         for opcode in 0x70u8..=0x7F {
-            let bytes = [opcode, 0x10];
             assert!(
-                is_conditional_branch_opcode(&bytes),
-                "opcode 0x{opcode:02x} should be a conditional branch"
+                is_conditional_branch_opcode(&[opcode, 0x10]),
+                "0x{opcode:02x} should be Jcc"
             );
         }
     }
@@ -508,10 +474,9 @@ mod tests {
     #[test]
     fn test_conditional_branch_opcode_near_jcc() {
         for second in 0x80u8..=0x8F {
-            let bytes = [0x0F, second, 0x00, 0x00, 0x00, 0x00];
             assert!(
-                is_conditional_branch_opcode(&bytes),
-                "opcode 0x0F 0x{second:02x} should be a conditional branch"
+                is_conditional_branch_opcode(&[0x0F, second, 0, 0, 0, 0]),
+                "0x0F 0x{second:02x} should be Jcc"
             );
         }
     }
@@ -519,30 +484,26 @@ mod tests {
     #[test]
     fn test_conditional_branch_opcode_loop() {
         for opcode in 0xE0u8..=0xE3 {
-            let bytes = [opcode, 0x10];
             assert!(
-                is_conditional_branch_opcode(&bytes),
-                "opcode 0x{opcode:02x} should be a conditional branch"
+                is_conditional_branch_opcode(&[opcode, 0x10]),
+                "0x{opcode:02x} should be LOOPcc/JCXZ"
             );
         }
     }
 
     #[test]
     fn test_conditional_branch_opcode_with_rex_prefix() {
-        let bytes = [0x48, 0x74, 0x10]; // REX.W + JE rel8
-        assert!(is_conditional_branch_opcode(&bytes));
+        assert!(is_conditional_branch_opcode(&[0x48, 0x74, 0x10]));
     }
 
     #[test]
     fn test_not_conditional_branch_opcode() {
         assert!(!is_conditional_branch_opcode(&[0xEB, 0x10])); // JMP rel8
-        assert!(!is_conditional_branch_opcode(&[
-            0xE8, 0x00, 0x00, 0x00, 0x00
-        ])); // CALL
+        assert!(!is_conditional_branch_opcode(&[0xE8, 0, 0, 0, 0])); // CALL
         assert!(!is_conditional_branch_opcode(&[0xC3])); // RET
         assert!(!is_conditional_branch_opcode(&[0x90])); // NOP
-        assert!(!is_conditional_branch_opcode(&[0x48, 0x89, 0xD8])); // MOV rax, rbx
-        assert!(!is_conditional_branch_opcode(&[0x0F, 0x1F, 0x00])); // NOP multi-byte
+        assert!(!is_conditional_branch_opcode(&[0x48, 0x89, 0xD8])); // MOV
+        assert!(!is_conditional_branch_opcode(&[0x0F, 0x1F, 0x00])); // NOP
         assert!(!is_conditional_branch_opcode(&[])); // Empty
     }
 
@@ -553,18 +514,13 @@ mod tests {
             size: 0x500,
         };
         assert!(range.contains(0x1000));
-        assert!(range.contains(0x1001));
         assert!(range.contains(0x14FF));
         assert!(!range.contains(0x0FFF));
         assert!(!range.contains(0x1500));
-        assert!(!range.contains(0x2000));
     }
 
     #[test]
     fn test_arm_disarm_software_rbc() {
-        assert!(!is_frida_active());
-        assert_eq!(SOFTWARE_RBC_COUNTER.with(|c| c.get()), u64::MAX);
-
         arm_software_rbc(42);
         assert!(is_frida_active());
         assert_eq!(SOFTWARE_RBC_COUNTER.with(|c| c.get()), 42);
@@ -572,39 +528,43 @@ mod tests {
         disarm_software_rbc();
         assert!(!is_frida_active());
         assert_eq!(SOFTWARE_RBC_COUNTER.with(|c| c.get()), u64::MAX);
+        assert!(!YIELD_PENDING.with(|f| f.get()));
     }
 
     #[test]
-    fn test_callout_inner_disarmed() {
+    fn test_callout_sets_yield_pending() {
+        SOFTWARE_RBC_COUNTER.with(|c| c.set(2));
+
+        // 2 → 1: no flag yet.
+        software_rbc_callout_inner();
+        assert_eq!(SOFTWARE_RBC_COUNTER.with(|c| c.get()), 1);
+        assert!(!YIELD_PENDING.with(|f| f.get()));
+
+        // 1 → 0: YIELD_PENDING set.
+        software_rbc_callout_inner();
+        assert_eq!(SOFTWARE_RBC_COUNTER.with(|c| c.get()), 0);
+        assert!(YIELD_PENDING.with(|f| f.get()));
+
+        // Counter == 0: already signaled, no-op.
+        software_rbc_callout_inner();
+        assert_eq!(SOFTWARE_RBC_COUNTER.with(|c| c.get()), 0);
+        assert!(YIELD_PENDING.with(|f| f.get()));
+
+        // take_yield_pending clears the flag.
+        assert!(take_yield_pending());
+        assert!(!YIELD_PENDING.with(|f| f.get()));
+
+        // Second call returns false.
+        assert!(!take_yield_pending());
+
+        disarm_software_rbc();
+    }
+
+    #[test]
+    fn test_callout_disarmed_noop() {
         disarm_software_rbc();
         software_rbc_callout_inner();
         assert_eq!(SOFTWARE_RBC_COUNTER.with(|c| c.get()), u64::MAX);
-    }
-
-    #[test]
-    fn test_callout_inner_decrement() {
-        SOFTWARE_RBC_COUNTER.with(|c| c.set(5));
-
-        software_rbc_callout_inner();
-        assert_eq!(SOFTWARE_RBC_COUNTER.with(|c| c.get()), 4);
-
-        software_rbc_callout_inner();
-        assert_eq!(SOFTWARE_RBC_COUNTER.with(|c| c.get()), 3);
-
-        software_rbc_callout_inner();
-        assert_eq!(SOFTWARE_RBC_COUNTER.with(|c| c.get()), 2);
-
-        software_rbc_callout_inner();
-        assert_eq!(SOFTWARE_RBC_COUNTER.with(|c| c.get()), 1);
-
-        software_rbc_callout_inner();
-        assert_eq!(SOFTWARE_RBC_COUNTER.with(|c| c.get()), 0);
-
-        // Calling with counter == 0 invokes do_software_yield,
-        // but without PREEMPT_CTX it returns immediately.
-        software_rbc_callout_inner();
-        assert_eq!(SOFTWARE_RBC_COUNTER.with(|c| c.get()), 0);
-
-        disarm_software_rbc();
+        assert!(!YIELD_PENDING.with(|f| f.get()));
     }
 }

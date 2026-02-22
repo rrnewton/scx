@@ -27,6 +27,17 @@ use crate::task::{OpsTaskState, Phase, SimTask, TaskState};
 use crate::trace::{DsqSampleTrigger, Trace, TraceKind};
 use crate::types::{CpuId, DsqId, KickFlags, Pid, TimeNs};
 
+/// Return a process-wide `Gum` handle, initializing on first call.
+///
+/// `Gum::obtain()` must only be called once per process — Stalker corrupts
+/// Frida's internal GLib thread state, so a second `Gum::obtain()` crashes.
+#[cfg(feature = "frida")]
+fn frida_gum() -> &'static frida_gum::Gum {
+    use std::sync::OnceLock;
+    static GUM: OnceLock<frida_gum::Gum> = OnceLock::new();
+    GUM.get_or_init(frida_gum::Gum::obtain)
+}
+
 /// How the simulation terminated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExitKind {
@@ -2632,7 +2643,7 @@ impl<S: Scheduler> Simulator<S> {
         let used_frida = if let Some(ref preemptive_cfg) = state.preemptive {
             if preemptive_cfg.use_frida {
                 if let Some(range) = self.scheduler.text_range() {
-                    let gum = frida_gum::Gum::obtain();
+                    let gum = frida_gum();
                     let text_range = crate::stalker::TextRange {
                         base: range.0,
                         size: range.1,
@@ -2644,7 +2655,7 @@ impl<S: Scheduler> Simulator<S> {
                         interleave_seed,
                         preemptive_cfg.timeslice_min,
                         preemptive_cfg.timeslice_max,
-                        &gum,
+                        gum,
                         &text_range,
                     );
                     true
@@ -3004,7 +3015,7 @@ impl<S: Scheduler> Simulator<S> {
             "frida interleave: starting dispatch"
         );
 
-        stalker::reset_callout_counter();
+        stalker::reset_counters();
 
         std::thread::scope(|s| {
             let ring_ref = &ring;
@@ -3073,14 +3084,14 @@ impl<S: Scheduler> Simulator<S> {
             ring.wait_all_done();
         });
 
-        stalker::reset_callout_counter();
-
         debug!(
             signal_preemptions = ring.signal_preemptions(),
             cooperative_yields = ring.cooperative_yields(),
             stalker_callouts = stalker::total_callouts(),
             "frida interleave: dispatch complete"
         );
+
+        stalker::reset_counters();
     }
     ///
     /// Each CPU's events are handled on a separate OS thread, interleaved
@@ -3159,6 +3170,8 @@ impl<S: Scheduler> Simulator<S> {
             #[cfg(feature = "frida")]
             let used_frida = if preemptive_cfg.use_frida {
                 if let Some(range) = self.scheduler.text_range() {
+                    let gum = frida_gum();
+
                     let text_range = crate::stalker::TextRange {
                         base: range.0,
                         size: range.1,
@@ -3178,6 +3191,7 @@ impl<S: Scheduler> Simulator<S> {
                         preemptive_cfg.timeslice_min,
                         preemptive_cfg.timeslice_max,
                         &text_range,
+                        gum,
                     );
                     true
                 } else {
@@ -3456,15 +3470,15 @@ impl<S: Scheduler> Simulator<S> {
         timeslice_min: u64,
         timeslice_max: u64,
         text_range: &crate::stalker::TextRange,
+        gum: &frida_gum::Gum,
     ) {
         use crate::interleave::WorkerId;
         use crate::preempt::{self, PreemptRing};
         use crate::stalker;
 
         let ring = PreemptRing::new(cpu_ids.len(), seed);
-        let gum = frida_gum::Gum::obtain();
-        let transformer = stalker::SyncTransformer::new(&gum, text_range);
-        stalker::reset_callout_counter();
+        let transformer = stalker::SyncTransformer::new(gum, text_range);
+        stalker::reset_counters();
 
         debug!(
             workers = cpu_ids.len(),
@@ -3477,7 +3491,6 @@ impl<S: Scheduler> Simulator<S> {
 
         std::thread::scope(|s| {
             let ring_ref = &ring;
-            let gum_ref = &gum;
             let sim_ref = sim_send;
             let state_ref = state_send;
             let tasks_ref = tasks_send;
@@ -3494,7 +3507,7 @@ impl<S: Scheduler> Simulator<S> {
                     let simp = sim_ref.0 as *const Simulator<S>;
                     let sp = state_ref.0;
 
-                    let mut stalker_inst = frida_gum::stalker::Stalker::new(gum_ref);
+                    let mut stalker_inst = frida_gum::stalker::Stalker::new(gum);
 
                     // Install with timer_fd=-1 (no PMU timer).
                     preempt::install(ring_ref, worker_id, -1, timeslice_min, timeslice_max);
@@ -3542,14 +3555,11 @@ impl<S: Scheduler> Simulator<S> {
             ring.wait_all_done();
         });
 
-        let (yield_entries, yield_no_ctx, yield_no_sim) = stalker::yield_diagnostics();
         debug!(
             signal_preemptions = ring.signal_preemptions(),
             cooperative_yields = ring.cooperative_yields(),
             stalker_callouts = stalker::total_callouts(),
-            yield_entries,
-            yield_no_ctx,
-            yield_no_sim,
+            deferred_yields = stalker::deferred_yields(),
             workers = cpu_ids.len(),
             "batch-concurrent frida: complete"
         );
