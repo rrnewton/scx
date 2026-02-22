@@ -8,7 +8,7 @@
 //! Usage:
 //!   cargo run --release --example measure_skid
 //!
-//! The tool tests several target periods (10, 100, 1000, 2000 branches)
+//! The tool tests several target periods (1, 5, 10, 100, 1000, 2000 branches)
 //! and for each one reports the distribution of skid values.
 
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
@@ -19,7 +19,7 @@ use scx_perf::{PmuConfig, RbcTimer, PERF_IOC_DISABLE};
 const TRIALS: usize = 500;
 
 /// Target periods to test.
-const TARGETS: &[u64] = &[10, 100, 1000, 2000];
+const TARGETS: &[u64] = &[1, 5, 10, 100, 1000, 2000];
 
 // --- Globals for async-signal-safe communication with signal handler ---
 
@@ -130,7 +130,7 @@ impl SkidStats {
 fn install_signal_handler() {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = handler as libc::sighandler_t;
+        sa.sa_sigaction = handler as *const () as usize;
         sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
         libc::sigemptyset(&mut sa.sa_mask);
         let ret = libc::sigaction(libc::SIGSTKFLT, &sa, std::ptr::null_mut());
