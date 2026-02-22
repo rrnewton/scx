@@ -578,6 +578,7 @@ impl<S: Scheduler> Simulator<S> {
             bpf_error: None,
             interleave: scenario.interleave,
             preemptive: scenario.preemptive.clone(),
+            replay_trace: scenario.replay_trace.clone(),
             in_concurrent_batch: false,
         };
 
@@ -2705,18 +2706,28 @@ impl<S: Scheduler> Simulator<S> {
         let interleave_seed = state.next_prng();
 
         if let Some(ref preemptive_cfg) = state.preemptive {
-            let timeslice_min = preemptive_cfg.timeslice_min;
-            let timeslice_max = preemptive_cfg.timeslice_max;
-            let cooperative_only = preemptive_cfg.cooperative_only;
-            self.dispatch_concurrent_preemptive(
-                &dispatch_cpus,
-                &state_send,
-                &sched_send,
-                interleave_seed,
-                timeslice_min,
-                timeslice_max,
-                cooperative_only,
-            );
+            if let Some(ref trace) = state.replay_trace {
+                self.dispatch_concurrent_replay(
+                    &dispatch_cpus,
+                    &state_send,
+                    &sched_send,
+                    interleave_seed,
+                    trace,
+                );
+            } else {
+                let timeslice_min = preemptive_cfg.timeslice_min;
+                let timeslice_max = preemptive_cfg.timeslice_max;
+                let cooperative_only = preemptive_cfg.cooperative_only;
+                self.dispatch_concurrent_preemptive(
+                    &dispatch_cpus,
+                    &state_send,
+                    &sched_send,
+                    interleave_seed,
+                    timeslice_min,
+                    timeslice_max,
+                    cooperative_only,
+                );
+            }
         } else {
             self.dispatch_concurrent_cooperative(
                 &dispatch_cpus,
@@ -3007,7 +3018,6 @@ impl<S: Scheduler> Simulator<S> {
     ///
     /// Falls back to cooperative-only if PMU or hardware breakpoints are
     /// unavailable.
-    #[allow(dead_code)] // TODO(sim-d46dd): wire into dispatch path
     fn dispatch_concurrent_replay(
         &self,
         dispatch_cpus: &[CpuId],

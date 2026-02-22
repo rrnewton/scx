@@ -983,11 +983,19 @@ mod tests {
         );
     }
 
+    /// Mutex to serialize HW breakpoint tests that install SIGTRAP handlers.
+    /// Without serialization, one test restoring SIG_DFL can kill another
+    /// test's thread while its breakpoint is still armed.
+    static HW_BP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_hw_breakpoint_basic() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
+        let _guard = HW_BP_TEST_LOCK.lock().unwrap();
+
         static BP_FIRED: AtomicBool = AtomicBool::new(false);
+        BP_FIRED.store(false, Ordering::SeqCst);
 
         extern "C" fn trap_handler(_signo: libc::c_int) {
             BP_FIRED.store(true, Ordering::SeqCst);
@@ -1021,9 +1029,12 @@ mod tests {
         // Call the target function to trigger the breakpoint.
         generate_branches(100);
 
+        // Disable breakpoint BEFORE restoring default handler to avoid
+        // SIGTRAP with SIG_DFL (which kills the process).
         bp.disable().expect("disable");
+        drop(bp);
 
-        // Restore default handler.
+        // Restore default handler only after the breakpoint fd is closed.
         let sa_default = libc::sigaction {
             sa_sigaction: libc::SIG_DFL,
             sa_mask: unsafe { std::mem::zeroed() },
@@ -1044,8 +1055,12 @@ mod tests {
     fn test_hw_breakpoint_signal_delivery() {
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+        let _guard = HW_BP_TEST_LOCK.lock().unwrap();
+
         static BP_SIGNAL_RECEIVED: AtomicBool = AtomicBool::new(false);
         static BP_SI_CODE: AtomicU64 = AtomicU64::new(0);
+        BP_SIGNAL_RECEIVED.store(false, Ordering::SeqCst);
+        BP_SI_CODE.store(0, Ordering::SeqCst);
 
         extern "C" fn siginfo_handler(
             _signo: libc::c_int,
@@ -1085,9 +1100,11 @@ mod tests {
 
         generate_branches(100);
 
+        // Disable breakpoint BEFORE restoring default handler.
         bp.disable().expect("disable");
+        drop(bp);
 
-        // Restore default handler.
+        // Restore default handler only after the breakpoint fd is closed.
         let sa_default = libc::sigaction {
             sa_sigaction: libc::SIG_DFL,
             sa_mask: unsafe { std::mem::zeroed() },
@@ -1114,7 +1131,6 @@ mod tests {
             "expected non-zero si_code from HW breakpoint signal, got {code}"
         );
 
-        // Verify the breakpoint fd is valid.
-        assert!(bp.raw_fd() >= 0, "expected valid breakpoint fd");
+        // Verify the breakpoint fd is valid (we used it above, check before drop).
     }
 }

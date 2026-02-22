@@ -28,6 +28,7 @@ use crate::dsq::DsqManager;
 use crate::ffi;
 use crate::fmt::FmtN;
 use crate::perf::RbcCounter;
+use crate::preempt::PreemptionTrace;
 use crate::scenario::{NoiseConfig, OverheadConfig, PreemptiveConfig};
 use crate::task::OpsTaskState;
 use crate::trace::{DispatchRejectReason, DsqSampleTrigger, Trace, TraceKind};
@@ -158,6 +159,8 @@ pub struct SimulatorState {
     pub interleave: bool,
     /// Preemptive interleaving configuration (None = disabled).
     pub preemptive: Option<PreemptiveConfig>,
+    /// Optional preemption trace for replay mode (None = disabled).
+    pub replay_trace: Option<PreemptionTrace>,
     /// True while inside a concurrent batch (same-timestamp per-CPU events
     /// being processed in parallel). When set, `process_kicked_cpus` defers
     /// kicks (accumulates in `kicked_cpus` but does not process) and
@@ -1567,6 +1570,7 @@ mod tests {
             bpf_error: None,
             interleave: false,
             preemptive: None,
+            replay_trace: None,
             in_concurrent_batch: false,
         }
     }
