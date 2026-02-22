@@ -578,6 +578,10 @@ impl<S: Scheduler> Simulator<S> {
             bpf_error: None,
             interleave: scenario.interleave,
             preemptive: scenario.preemptive.clone(),
+            structop_accum: vec![
+                crate::preempt::StructopInfo::default();
+                scenario.nr_cpus as usize
+            ],
             in_concurrent_batch: false,
         };
 
@@ -2950,6 +2954,11 @@ impl<S: Scheduler> Simulator<S> {
                     }
                     preempt::install(ring_ref, worker_id, timer_fd, timeslice_min, timeslice_max);
 
+                    // Seed per-CPU structop accumulators from previous rounds.
+                    // Each worker touches only its own CPU index — no races.
+                    let structop_base = unsafe { (&(*sp).structop_accum)[cpu.0 as usize] };
+                    preempt::seed_structop(&structop_base);
+
                     ring_ref.wait_for_token(worker_id);
 
                     // Enter sim AFTER acquiring the token to avoid racing on
@@ -2989,6 +2998,12 @@ impl<S: Scheduler> Simulator<S> {
 
                     ring_ref.finish(worker_id);
                     kfuncs::exit_sim();
+
+                    // Drain per-CPU structop state back to accumulators.
+                    unsafe {
+                        (&mut (*sp).structop_accum)[cpu.0 as usize] = preempt::structop_info();
+                    }
+
                     preempt::uninstall();
                     // timer dropped here — closes the perf fd
                 });
@@ -3260,6 +3275,10 @@ impl<S: Scheduler> Simulator<S> {
 
                     preempt::install(ring_ref, worker_id, timer_fd, timeslice_min, timeslice_max);
 
+                    // Seed per-CPU structop accumulators from previous rounds.
+                    let structop_base = unsafe { (&(*sp).structop_accum)[cpu.0 as usize] };
+                    preempt::seed_structop(&structop_base);
+
                     ring_ref.wait_for_token(worker_id);
 
                     // Enter sim AFTER acquiring the token to avoid racing on
@@ -3296,6 +3315,12 @@ impl<S: Scheduler> Simulator<S> {
 
                     ring_ref.finish(worker_id);
                     kfuncs::exit_sim();
+
+                    // Drain per-CPU structop state back to accumulators.
+                    unsafe {
+                        (&mut (*sp).structop_accum)[cpu.0 as usize] = preempt::structop_info();
+                    }
+
                     preempt::uninstall();
                 });
             }

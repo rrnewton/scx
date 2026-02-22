@@ -607,6 +607,92 @@ fn futex_wake(futex: &AtomicU32, count: i32) {
 }
 
 // ---------------------------------------------------------------------------
+// Structop tracking — per-callback context for trace messages
+// ---------------------------------------------------------------------------
+
+/// Snapshot of structop tracking for trace output.
+///
+/// A "structop" is one invocation of a scheduler ops callback (dispatch,
+/// enqueue, select_cpu, etc.). All counters are monotonically increasing
+/// across the entire simulation for a given CPU:
+/// - `cpu_count`: how many structops this CPU has entered
+/// - `global_count`: how many structops all CPUs have entered
+/// - `rbc_total`: cumulative retired conditional branches on this CPU
+/// - `kfunc_count`: cumulative cooperative yields on this CPU
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StructopInfo {
+    /// Per-CPU structop call count (monotonically increasing).
+    pub cpu_count: u64,
+    /// Global structop call count across all CPUs (monotonically increasing).
+    pub global_count: u64,
+    /// Cumulative RBC count on this CPU (monotonically increasing).
+    pub rbc_total: u64,
+    /// Cumulative cooperative yield count on this CPU (monotonically increasing).
+    pub kfunc_count: u64,
+}
+
+thread_local! {
+    static STRUCTOP_CPU_COUNT: Cell<u64> = const { Cell::new(0) };
+    static STRUCTOP_RBC_TOTAL: Cell<u64> = const { Cell::new(0) };
+    static STRUCTOP_KFUNC_COUNT: Cell<u64> = const { Cell::new(0) };
+    static IN_STRUCTOP: Cell<bool> = const { Cell::new(false) };
+}
+static STRUCTOP_GLOBAL_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Seed the thread-local structop counters with base offsets from previous
+/// dispatch rounds. Call on each worker thread after `install()`.
+pub fn seed_structop(base: &StructopInfo) {
+    STRUCTOP_CPU_COUNT.with(|c| c.set(base.cpu_count));
+    STRUCTOP_RBC_TOTAL.with(|c| c.set(base.rbc_total));
+    STRUCTOP_KFUNC_COUNT.with(|c| c.set(base.kfunc_count));
+    IN_STRUCTOP.with(|c| c.set(false));
+}
+
+/// Begin a new structop: increment per-CPU and global counts.
+fn begin_structop() {
+    STRUCTOP_CPU_COUNT.with(|c| c.set(c.get() + 1));
+    STRUCTOP_GLOBAL_COUNT.fetch_add(1, SeqCst);
+}
+
+/// Read current structop tracking state.
+pub fn structop_info() -> StructopInfo {
+    StructopInfo {
+        cpu_count: STRUCTOP_CPU_COUNT.with(|c| c.get()),
+        global_count: STRUCTOP_GLOBAL_COUNT.load(SeqCst),
+        rbc_total: STRUCTOP_RBC_TOTAL.with(|c| c.get()),
+        kfunc_count: STRUCTOP_KFUNC_COUNT.with(|c| c.get()),
+    }
+}
+
+/// Record RBC consumed by a preemption on this worker.
+///
+/// Called from the signal handler. Accumulates into the monotonic
+/// per-CPU RBC total.
+pub fn record_rbc_preemption(timeslice: u64) {
+    STRUCTOP_RBC_TOTAL.with(|c| c.set(c.get() + timeslice));
+}
+
+/// Increment the per-CPU kfunc yield counter (monotonic).
+///
+/// Called from `maybe_yield_preemptive()` on each cooperative yield.
+pub fn inc_structop_kfunc() {
+    STRUCTOP_KFUNC_COUNT.with(|c| c.set(c.get() + 1));
+}
+
+/// Detect structop boundary transitions and call `begin_structop()` when
+/// entering a new ops callback.
+pub fn maybe_begin_structop(in_ops: bool) {
+    IN_STRUCTOP.with(|c| {
+        if in_ops && !c.get() {
+            c.set(true);
+            begin_structop();
+        } else if !in_ops {
+            c.set(false);
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // PreemptRing — futex-based token ring (signal-safe)
 // ---------------------------------------------------------------------------
 
@@ -927,20 +1013,32 @@ pub fn maybe_yield_preemptive() {
         )
     };
 
+    // Detect structop boundary transitions.
+    let in_ops = saved_ops_ctx != crate::kfuncs::OpsContext::None;
+    maybe_begin_structop(in_ops);
+
+    // Increment per-structop kfunc yield counter.
+    inc_structop_kfunc();
+
+    let sinfo = structop_info();
+
     // Release token and block until re-selected (futex-based).
     ring.inc_cooperative_yield();
     tracing::debug!(
-        worker = ctx.worker_id.0,
-        cpu = saved_cpu.0,
-        "preempt: cooperative yield (kfunc boundary)"
+        "preempt:kfunc cooperative, structop#{0}:{1} kfunc#{2} worker={3}",
+        sinfo.cpu_count,
+        sinfo.global_count,
+        sinfo.kfunc_count,
+        ctx.worker_id.0,
     );
     ring.yield_token(ctx.worker_id);
 
     // Resumed — restore our context to SimulatorState.
     tracing::debug!(
-        worker = ctx.worker_id.0,
-        cpu = saved_cpu.0,
-        "preempt: resumed after cooperative yield"
+        "preempt: resumed (kfunc), structop#{0}:{1} worker={2}",
+        sinfo.cpu_count,
+        sinfo.global_count,
+        ctx.worker_id.0,
     );
     unsafe {
         (*sim_ptr).current_cpu = saved_cpu;
@@ -1097,10 +1195,14 @@ extern "C" fn preempt_handler(
         )
     };
 
-    // 4. Emit trace message and record preemption point.
+    // 4. Track structop RBC and emit trace message.
+    record_rbc_preemption(rbc_count);
+    let sinfo = structop_info();
     tracing::trace!(
-        "preempt:pmu rbc={} rip=0x{:x}",
-        rbc_count,
+        "preempt:pmu structop#{0}:{1} rbc={2} rip=0x{3:x}",
+        sinfo.cpu_count,
+        sinfo.global_count,
+        sinfo.rbc_total,
         instruction_pointer,
     );
     ring.record_preemption(rbc_count, instruction_pointer, saved_cpu);

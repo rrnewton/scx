@@ -158,6 +158,10 @@ pub struct SimulatorState {
     pub interleave: bool,
     /// Preemptive interleaving configuration (None = disabled).
     pub preemptive: Option<PreemptiveConfig>,
+    /// Per-CPU structop accumulators that persist across dispatch rounds.
+    /// Indexed by CpuId.0. Seeded into worker thread-locals at the start
+    /// of each dispatch round and drained back at the end.
+    pub structop_accum: Vec<crate::preempt::StructopInfo>,
     /// True while inside a concurrent batch (same-timestamp per-CPU events
     /// being processed in parallel). When set, `process_kicked_cpus` defers
     /// kicks (accumulates in `kicked_cpus` but does not process) and
@@ -1573,6 +1577,7 @@ mod tests {
             bpf_error: None,
             interleave: false,
             preemptive: None,
+            structop_accum: vec![crate::preempt::StructopInfo::default(); nr_cpus as usize],
             in_concurrent_batch: false,
         }
     }
