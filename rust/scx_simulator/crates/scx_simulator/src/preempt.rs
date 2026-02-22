@@ -967,7 +967,7 @@ pub fn maybe_yield_preemptive() {
             crate::stalker::record_rbc_expiry();
             let sinfo = crate::stalker::structop_info();
             tracing::trace!(
-                "preempt:frida rbc structop {}:{} rbc {} rip 0x{:x}",
+                "preempt:frida structop#{}:{} rbc={} rip=0x{:x}",
                 sinfo.cpu_count,
                 sinfo.global_count,
                 sinfo.rbc_total,
@@ -1020,7 +1020,7 @@ pub fn maybe_yield_preemptive() {
             crate::stalker::inc_structop_kfunc();
             let sinfo = crate::stalker::structop_info();
             tracing::trace!(
-                "preempt:frida kfunc structop {}:{} kfunc {}",
+                "preempt:frida structop#{}:{} kfunc={}",
                 sinfo.cpu_count,
                 sinfo.global_count,
                 sinfo.kfunc_count,
