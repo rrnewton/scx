@@ -1,0 +1,53 @@
+name: simulator-tests
+
+on:
+  push:
+    branches: [main, simulator-frida]
+    paths:
+      - 'rust/scx_simulator/**'
+      - '.github/workflows/simulator.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'rust/scx_simulator/**'
+      - '.github/workflows/simulator.yml'
+
+defaults:
+  run:
+    working-directory: rust/scx_simulator
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/scx_simulator
+          prefix-key: "simulator"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libelf-dev zlib1g-dev
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (default features)
+        run: cargo clippy --all -- -D warnings
+
+      - name: Clippy (frida feature)
+        run: cargo clippy -p scx_simulator --features frida -- -D warnings
+
+      - name: Test (default features)
+        run: cargo test --all
+
+      - name: Test (frida feature including Stalker)
+        run: cargo test -p scx_simulator --features frida
