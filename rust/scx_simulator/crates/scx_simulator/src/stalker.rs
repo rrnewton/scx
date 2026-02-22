@@ -83,6 +83,25 @@ thread_local! {
     /// absolute RIPs to `.so`-relative offsets for ASLR-resilient
     /// determinism comparisons.
     static TEXT_BASE: Cell<u64> = const { Cell::new(0) };
+
+    // -- Structop tracking --------------------------------------------------
+
+    /// Per-CPU structop call counter (how many structops this thread has run).
+    static STRUCTOP_CPU_COUNT: Cell<u64> = const { Cell::new(0) };
+
+    /// Cumulative RBC count across timeslices within the current structop.
+    static STRUCTOP_RBC_TOTAL: Cell<u64> = const { Cell::new(0) };
+
+    /// Kfunc call count within the current structop.
+    static STRUCTOP_KFUNC_COUNT: Cell<u64> = const { Cell::new(0) };
+
+    /// The timeslice used for the current (or most recent) arming.
+    /// Needed to compute consumed RBC when a timeslice expires.
+    static CURRENT_TIMESLICE: Cell<u64> = const { Cell::new(0) };
+
+    /// Whether we are currently inside a structop (ops_context != None).
+    /// Used to detect structop boundaries at kfunc entry points.
+    static IN_STRUCTOP: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Global counter for total callouts executed (for diagnostics).
@@ -90,6 +109,9 @@ static TOTAL_CALLOUTS: AtomicU64 = AtomicU64::new(0);
 
 /// Global counter for deferred yields consumed at kfunc boundaries.
 static DEFERRED_YIELDS: AtomicU64 = AtomicU64::new(0);
+
+/// Global structop call counter (monotonically increasing across all CPUs).
+static STRUCTOP_GLOBAL_COUNT: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // TextRange — address range of the scheduler .so's executable segment
@@ -352,6 +374,9 @@ pub fn rearm_software_rbc(timeslice: u64) {
     YIELD_PENDING.with(|flag| {
         flag.set(false);
     });
+    CURRENT_TIMESLICE.with(|ts| {
+        ts.set(timeslice);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -373,6 +398,9 @@ pub fn arm_software_rbc(timeslice: u64, text_base: u64) {
     TEXT_BASE.with(|base| {
         base.set(text_base);
     });
+    CURRENT_TIMESLICE.with(|ts| {
+        ts.set(timeslice);
+    });
 }
 
 /// Disarm the software RBC counter.
@@ -388,6 +416,9 @@ pub fn disarm_software_rbc() {
     });
     TEXT_BASE.with(|base| {
         base.set(0);
+    });
+    CURRENT_TIMESLICE.with(|ts| {
+        ts.set(0);
     });
 }
 
@@ -433,6 +464,82 @@ pub fn deferred_yields() -> u64 {
 pub fn reset_counters() {
     TOTAL_CALLOUTS.store(0, Relaxed);
     DEFERRED_YIELDS.store(0, Relaxed);
+    STRUCTOP_GLOBAL_COUNT.store(0, Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// Structop tracking — per-structop RBC and kfunc counters
+// ---------------------------------------------------------------------------
+
+/// Snapshot of structop tracking state for trace output.
+pub struct StructopInfo {
+    /// Per-CPU structop call number (1-based).
+    pub cpu_count: u64,
+    /// Global structop call number (1-based).
+    pub global_count: u64,
+    /// Cumulative RBC count within this structop.
+    pub rbc_total: u64,
+    /// Kfunc call count within this structop.
+    pub kfunc_count: u64,
+}
+
+/// Begin a new structop on the current thread.
+///
+/// Increments the per-CPU and global structop counters and resets
+/// per-structop accumulators (RBC total, kfunc count). Call this
+/// before entering scheduler C code for an ops callback.
+pub fn begin_structop() {
+    STRUCTOP_CPU_COUNT.with(|c| c.set(c.get() + 1));
+    STRUCTOP_GLOBAL_COUNT.fetch_add(1, Relaxed);
+    STRUCTOP_RBC_TOTAL.with(|c| c.set(0));
+    STRUCTOP_KFUNC_COUNT.with(|c| c.set(0));
+    IN_STRUCTOP.with(|c| c.set(true));
+}
+
+/// Detect a structop boundary and begin a new structop if needed.
+///
+/// Called at kfunc entry points (via `maybe_yield_preemptive`). If
+/// `in_ops` is true (ops_context != None) and we were not previously
+/// inside a structop, this is a new structop boundary. The caller
+/// passes `in_ops` based on the current `SimulatorState::ops_context`.
+pub fn maybe_begin_structop(in_ops: bool) {
+    if in_ops {
+        let was_in = IN_STRUCTOP.with(|c| c.get());
+        if !was_in {
+            begin_structop();
+        }
+    } else {
+        IN_STRUCTOP.with(|c| c.set(false));
+    }
+}
+
+/// Record that the RBC timeslice expired within the current structop.
+///
+/// Adds the timeslice length to the cumulative RBC total, since the
+/// counter reaching zero means exactly `timeslice` branches were retired.
+pub fn record_rbc_expiry() {
+    let ts = CURRENT_TIMESLICE.with(|c| c.get());
+    STRUCTOP_RBC_TOTAL.with(|c| c.set(c.get() + ts));
+}
+
+/// Increment the kfunc counter for the current structop.
+pub fn inc_structop_kfunc() {
+    STRUCTOP_KFUNC_COUNT.with(|c| c.set(c.get() + 1));
+}
+
+/// Get the current structop tracking state for trace output.
+pub fn structop_info() -> StructopInfo {
+    StructopInfo {
+        cpu_count: STRUCTOP_CPU_COUNT.with(|c| c.get()),
+        global_count: STRUCTOP_GLOBAL_COUNT.load(Relaxed),
+        rbc_total: STRUCTOP_RBC_TOTAL.with(|c| c.get()),
+        kfunc_count: STRUCTOP_KFUNC_COUNT.with(|c| c.get()),
+    }
+}
+
+/// Reset per-CPU structop counter (called when a worker finishes).
+pub fn reset_structop_cpu_count() {
+    STRUCTOP_CPU_COUNT.with(|c| c.set(0));
 }
 
 // ---------------------------------------------------------------------------

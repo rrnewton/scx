@@ -921,6 +921,12 @@ pub fn maybe_yield_preemptive() {
     // Check for deferred Frida Stalker preemption.
     #[cfg(feature = "frida")]
     if crate::stalker::is_frida_active() {
+        // Detect structop boundaries: when ops_context transitions from
+        // None to non-None, a new scheduler ops call has started.
+        if let Some(sp) = crate::kfuncs::sim_state_ptr() {
+            let in_ops = unsafe { (*sp).ops_context } != crate::kfuncs::OpsContext::None;
+            crate::stalker::maybe_begin_structop(in_ops);
+        }
         if let Some(yield_rip) = crate::stalker::take_yield_pending() {
             // Deferred preemption: the Stalker callout set YIELD_PENDING because
             // the software RBC counter expired. Perform the actual yield here.
@@ -958,21 +964,19 @@ pub fn maybe_yield_preemptive() {
             }
 
             ring.inc_signal_preempt();
+            crate::stalker::record_rbc_expiry();
+            let sinfo = crate::stalker::structop_info();
             tracing::trace!(
-                worker = ctx.worker_id.0,
-                cpu = saved_cpu.0,
-                rip = format_args!("0x{yield_rip:x}"),
-                rip_offset = format_args!("0x{rip_offset:x}"),
-                "preempt: frida software RBC yield (deferred to kfunc boundary)"
+                "preempt:frida rbc structop {}:{} rbc {} rip 0x{:x}",
+                sinfo.cpu_count,
+                sinfo.global_count,
+                sinfo.rbc_total,
+                rip_offset,
             );
             ring.yield_token(ctx.worker_id);
 
             // Resumed — restore SimulatorState context.
-            tracing::trace!(
-                worker = ctx.worker_id.0,
-                cpu = saved_cpu.0,
-                "preempt: resumed after frida yield"
-            );
+            tracing::trace!("resumed after frida rbc yield");
             unsafe {
                 (*sim_ptr).current_cpu = saved_cpu;
                 (*sim_ptr).ops_context = saved_ops_ctx;
@@ -1006,19 +1010,39 @@ pub fn maybe_yield_preemptive() {
 
     // Release token and block until re-selected (futex-based).
     ring.inc_cooperative_yield();
-    tracing::debug!(
-        worker = ctx.worker_id.0,
-        cpu = saved_cpu.0,
-        "preempt: cooperative yield (kfunc boundary)"
-    );
+    #[cfg(feature = "frida")]
+    let _is_frida = crate::stalker::is_frida_active();
+    #[cfg(not(feature = "frida"))]
+    let _is_frida = false;
+    if _is_frida {
+        #[cfg(feature = "frida")]
+        {
+            crate::stalker::inc_structop_kfunc();
+            let sinfo = crate::stalker::structop_info();
+            tracing::trace!(
+                "preempt:frida kfunc structop {}:{} kfunc {}",
+                sinfo.cpu_count,
+                sinfo.global_count,
+                sinfo.kfunc_count,
+            );
+        }
+    } else {
+        tracing::debug!(
+            worker = ctx.worker_id.0,
+            cpu = saved_cpu.0,
+            "preempt: cooperative yield (kfunc boundary)"
+        );
+    }
     ring.yield_token(ctx.worker_id);
 
     // Resumed — restore our context to SimulatorState.
-    tracing::debug!(
-        worker = ctx.worker_id.0,
-        cpu = saved_cpu.0,
-        "preempt: resumed after cooperative yield"
-    );
+    if !_is_frida {
+        tracing::debug!(
+            worker = ctx.worker_id.0,
+            cpu = saved_cpu.0,
+            "preempt: resumed after cooperative yield"
+        );
+    }
     unsafe {
         (*sim_ptr).current_cpu = saved_cpu;
         (*sim_ptr).ops_context = saved_ops_ctx;

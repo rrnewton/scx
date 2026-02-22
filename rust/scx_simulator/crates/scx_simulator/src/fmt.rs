@@ -323,8 +323,50 @@ where
         // buffer reuse that gets corrupted under Frida Stalker DBI.
         let mut buf = String::with_capacity(128);
         self.format_event_to_buf(&mut buf, event);
-        Self::write_stderr(buf.as_bytes());
+        // Sanitize: strip bytes that are not printable ASCII, whitespace,
+        // or ANSI escape sequences. Frida Stalker DBI can corrupt
+        // thread-local state, injecting binary garbage into format buffers.
+        let sanitized = sanitize_trace_output(buf.as_bytes());
+        Self::write_stderr(&sanitized);
     }
+}
+
+/// Sanitize trace output by removing non-printable bytes.
+///
+/// Replaces any byte that is not printable ASCII (0x20..=0x7E), newline (0x0A),
+/// tab (0x09), or carriage return (0x0D) with nothing (strips it), EXCEPT
+/// for ESC (0x1B) which starts ANSI escape sequences. ANSI sequences
+/// (`ESC [` through the terminating letter) are preserved for color output.
+fn sanitize_trace_output(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        let b = data[i];
+        if b == 0x1B {
+            // ANSI escape sequence: copy ESC and everything through the
+            // terminating byte (an ASCII letter, 0x40..=0x7E for CSI).
+            out.push(b);
+            i += 1;
+            while i < data.len() {
+                let c = data[i];
+                out.push(c);
+                i += 1;
+                // CSI sequences (ESC [ ... <letter>) terminate at the
+                // first byte in 0x40..=0x7E. For our purposes, any
+                // ASCII letter ends the sequence.
+                if (0x40..=0x7E).contains(&c) {
+                    break;
+                }
+            }
+        } else if b == b'\n' || b == b'\t' || b == b'\r' || (0x20..=0x7E).contains(&b) {
+            out.push(b);
+            i += 1;
+        } else {
+            // Non-printable byte (binary garbage): skip it.
+            i += 1;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -400,5 +442,34 @@ mod tests {
             FmtTs::global(999_999_000_000).to_string(),
             "999_999_000_000:G"
         );
+    }
+
+    #[test]
+    fn test_sanitize_trace_output() {
+        // Plain ASCII passes through
+        assert_eq!(sanitize_trace_output(b"hello world"), b"hello world");
+
+        // Newlines and tabs pass through
+        assert_eq!(sanitize_trace_output(b"a\nb\tc"), b"a\nb\tc");
+
+        // Binary garbage is stripped
+        assert_eq!(sanitize_trace_output(b"he\x00llo"), b"hello");
+        assert_eq!(sanitize_trace_output(b"\x01\x02ok\x03"), b"ok");
+        assert_eq!(sanitize_trace_output(b"ab\x80\xff\xfecde"), b"abcde");
+
+        // ANSI escape sequences are preserved
+        let ansi = b"\x1b[32mGREEN\x1b[0m";
+        assert_eq!(sanitize_trace_output(ansi), ansi.to_vec());
+
+        // Mixed: ANSI + garbage
+        let mixed = b"\x1b[31mRED\x1b[0m\x00\x01tail";
+        let expected = b"\x1b[31mRED\x1b[0mtail";
+        assert_eq!(sanitize_trace_output(mixed), expected.to_vec());
+
+        // Empty input
+        assert_eq!(sanitize_trace_output(b""), b"");
+
+        // DEL (0x7F) is stripped
+        assert_eq!(sanitize_trace_output(b"ab\x7fcd"), b"abcd");
     }
 }

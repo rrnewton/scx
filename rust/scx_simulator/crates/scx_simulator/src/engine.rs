@@ -3064,6 +3064,7 @@ impl<S: Scheduler> Simulator<S> {
                             .and_then(|pid| sim.task_pid_to_raw.get(&pid).copied())
                             .map_or(std::ptr::null_mut(), |raw| raw as *mut c_void);
 
+                        stalker::begin_structop();
                         debug!(cpu = cpu.0, "dispatch (frida)");
                         (*schp).dispatch(cpu.0 as i32, prev_raw);
                         sim.ops_context = OpsContext::None;
