@@ -1097,7 +1097,12 @@ extern "C" fn preempt_handler(
         )
     };
 
-    // 4. Record the preemption point for determinism verification.
+    // 4. Emit trace message and record preemption point.
+    tracing::trace!(
+        "preempt:pmu rbc={} rip=0x{:x}",
+        rbc_count,
+        instruction_pointer,
+    );
     ring.record_preemption(rbc_count, instruction_pointer, saved_cpu);
 
     // 5. Yield token (futex-based, signal-safe). Blocks until re-selected.
