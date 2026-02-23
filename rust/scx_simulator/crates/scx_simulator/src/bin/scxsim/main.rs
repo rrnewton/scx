@@ -9,7 +9,7 @@ use scx_simulator::{
     compare_checkpoints, discover_schedulers, drain_determinism_checkpoints,
     drain_preemption_records, enable_determinism_mode, enable_preemption_collection, load_rtapp,
     scheduler_so_base, DynamicScheduler, PmuEvent, PreemptionTrace, PreemptiveConfig, SimFormat,
-    Simulator, SIM_LOCK,
+    Simulator, TraceStats, SIM_LOCK,
 };
 
 mod real_run;
@@ -432,6 +432,10 @@ fn run_simulation(cli: &Cli, scenario: scx_simulator::Scenario) -> Result<(), St
     }
 
     let trace = Simulator::new(sched).run(scenario);
+
+    // Print end-of-simulation summary.
+    let stats = TraceStats::from_trace(&trace);
+    stats.print_summary();
 
     if cli.dump_trace {
         trace.dump();
