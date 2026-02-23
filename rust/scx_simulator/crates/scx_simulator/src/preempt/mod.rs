@@ -37,6 +37,7 @@
 //!
 //! [`interleave`]: crate::interleave
 
+use core::fmt::Write as FmtWrite;
 use std::cell::Cell;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::SeqCst};
@@ -1326,6 +1327,53 @@ pub fn resume_timer() {
 }
 
 // ---------------------------------------------------------------------------
+// Signal-safe stderr writer (no allocation, no locks)
+// ---------------------------------------------------------------------------
+
+/// Fixed-size stack buffer that implements `fmt::Write` for use in signal
+/// handlers. Writes into a `[u8; N]` without allocation — excess bytes
+/// are silently dropped.
+struct StackWriter<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
+}
+
+impl<'a> StackWriter<'a> {
+    fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.pos]
+    }
+}
+
+impl FmtWrite for StackWriter<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let bytes = s.as_bytes();
+        let remaining = self.buf.len() - self.pos;
+        let n = bytes.len().min(remaining);
+        self.buf[self.pos..self.pos + n].copy_from_slice(&bytes[..n]);
+        self.pos += n;
+        Ok(())
+    }
+}
+
+/// Write a pre-formatted message to stderr (async-signal-safe).
+///
+/// Uses raw `libc::write(STDERR_FILENO, ...)` which is guaranteed
+/// async-signal-safe by POSIX.
+fn write_stderr(buf: &[u8]) {
+    unsafe {
+        libc::write(
+            libc::STDERR_FILENO,
+            buf.as_ptr() as *const libc::c_void,
+            buf.len(),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Signal handler (preemptive yield)
 // ---------------------------------------------------------------------------
 
@@ -1445,14 +1493,32 @@ extern "C" fn preempt_handler(
 
     let (saved_cpu, saved_waker) = unsafe { ((*sim_ptr).current_cpu, (*sim_ptr).waker_task_raw) };
 
-    // 4. Track structop RBC.
-    //    NOTE: Do NOT call tracing::trace!() here — tracing uses internal
-    //    mutexes and is NOT async-signal-safe. Calling it from a signal
-    //    handler deadlocks when the main thread is mid-tracing call.
+    // 4. Track structop RBC and emit trace (signal-safe stderr write).
     record_rbc_preemption(rbc_count);
     // Cache ops context so structop_info() picks it up.
     set_current_ops_context(saved_ops_ctx);
     let sinfo = structop_info();
+
+    // Emit preempt:pmu trace to stderr if TRACE level is enabled.
+    // We cannot use tracing::trace!() here — it uses internal mutexes and
+    // is NOT async-signal-safe. Instead we check the tracing level filter
+    // (atomic read, signal-safe) and write directly to stderr.
+    if tracing::level_filters::LevelFilter::current() >= tracing::Level::TRACE {
+        let ops = sinfo.ops_context.short_name();
+        let kfn = if sinfo.kfunc_name.is_empty() {
+            "-"
+        } else {
+            sinfo.kfunc_name
+        };
+        let mut buf = [0u8; 256];
+        let mut w = StackWriter::new(&mut buf);
+        let _ = writeln!(
+            w,
+            "preempt:pmu ops={} kfunc={} structop#{}:{} rbc={} rip=0x{:x}",
+            ops, kfn, sinfo.cpu_count, sinfo.global_count, sinfo.rbc_total, instruction_pointer,
+        );
+        write_stderr(w.as_bytes());
+    }
 
     // 4a. Record the preemption point (with structop context).
     ring.record_preemption(
