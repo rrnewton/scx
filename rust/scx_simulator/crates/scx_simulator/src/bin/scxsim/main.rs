@@ -421,6 +421,11 @@ fn run_simulation(cli: &Cli, scenario: scx_simulator::Scenario) -> Result<(), St
     let sched = load_scheduler(&cli.scheduler, cli.cpus)?;
     let _lock = SIM_LOCK.lock().unwrap();
 
+    // Capture .so base address BEFORE the simulation runs. The scheduler
+    // .so is unloaded when the Simulator is dropped, so scheduler_so_base()
+    // must be called while the library is still mapped.
+    let so_base = scheduler_so_base();
+
     // Enable preemption recording if --record-preemptions is set.
     if cli.record_preemptions.is_some() {
         enable_preemption_collection();
@@ -447,7 +452,6 @@ fn run_simulation(cli: &Cli, scenario: scx_simulator::Scenario) -> Result<(), St
         let num_workers = cli.cpus as usize;
         let preemption_trace =
             PreemptionTrace::from_records(&records, num_workers, cli.break_on.to_pmu_event());
-        let so_base = scheduler_so_base();
 
         let mut file = std::fs::File::create(path)
             .map_err(|e| format!("failed to create {}: {e}", path.display()))?;

@@ -103,6 +103,18 @@ impl std::fmt::Display for PreemptionRecord {
 /// Number of AtomicU64 slots per preemption record.
 const RECORD_FIELDS: usize = 8;
 
+/// Global monotonic sequence counter shared across all `PreemptionRecordStore`
+/// instances. Ensures unique, globally-ordered sequence numbers even when
+/// multiple `PreemptRing`s are created across dispatch rounds.
+static PREEMPTION_GLOBAL_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Reset the global preemption sequence counter.
+///
+/// Call before starting a new simulation to get clean sequence numbers.
+pub fn reset_preemption_sequence() {
+    PREEMPTION_GLOBAL_SEQ.store(0, SeqCst);
+}
+
 /// Fixed-size storage for preemption records (signal-safe).
 ///
 /// Uses a fixed array with atomic index to avoid heap allocation in signal
@@ -112,8 +124,6 @@ pub(crate) struct PreemptionRecordStore {
     records: Box<[AtomicU64; MAX_PREEMPTION_RECORDS * RECORD_FIELDS]>,
     /// Number of records stored (atomic for signal safety).
     count: AtomicUsize,
-    /// Sequence counter for ordering records.
-    sequence: AtomicU64,
 }
 
 impl PreemptionRecordStore {
@@ -128,7 +138,6 @@ impl PreemptionRecordStore {
         PreemptionRecordStore {
             records,
             count: AtomicUsize::new(0),
-            sequence: AtomicU64::new(0),
         }
     }
 
@@ -149,7 +158,7 @@ impl PreemptionRecordStore {
             self.count.fetch_sub(1, SeqCst);
             return None;
         }
-        let seq = self.sequence.fetch_add(1, SeqCst);
+        let seq = PREEMPTION_GLOBAL_SEQ.fetch_add(1, SeqCst);
         let base = idx * RECORD_FIELDS;
         self.records[base].store(rbc_count, SeqCst);
         self.records[base + 1].store(instruction_pointer, SeqCst);
@@ -577,7 +586,9 @@ static GLOBAL_PREEMPTION_COLLECTOR: Mutex<Option<Vec<PreemptionRecord>>> = Mutex
 ///
 /// Call this before running a simulation to start collecting preemption records.
 /// Records are accumulated until `drain_preemption_records()` is called.
+/// Also resets the global sequence counter so records start at seq=0.
 pub fn enable_preemption_collection() {
+    reset_preemption_sequence();
     let mut guard = GLOBAL_PREEMPTION_COLLECTOR.lock().unwrap();
     *guard = Some(Vec::new());
 }

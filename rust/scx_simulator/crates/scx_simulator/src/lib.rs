@@ -71,9 +71,9 @@ pub use preempt::trace::PreemptionTrace;
 pub use preempt::{
     compare_checkpoints, drain_determinism_checkpoints, drain_preemption_records,
     enable_determinism_mode, enable_preemption_collection, fnv1a_combine, fnv1a_hash_bytes,
-    fnv1a_hash_u64, is_determinism_mode_enabled, record_checkpoint, scheduler_so_base,
-    CheckpointDivergence, CheckpointEvent, DeterminismCheckpoint, DivergenceType, PreemptionRecord,
-    StructopInfo,
+    fnv1a_hash_u64, is_determinism_mode_enabled, record_checkpoint, reset_preemption_sequence,
+    scheduler_so_base, CheckpointDivergence, CheckpointEvent, DeterminismCheckpoint,
+    DivergenceType, PreemptionRecord, StructopInfo,
 };
 pub use rtapp::load_rtapp;
 pub use scenario::{
