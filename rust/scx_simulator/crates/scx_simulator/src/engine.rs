@@ -27,6 +27,17 @@ use crate::task::{OpsTaskState, Phase, SimTask, TaskState};
 use crate::trace::{DsqSampleTrigger, Trace, TraceKind};
 use crate::types::{CpuId, DsqId, KickFlags, Pid, TimeNs};
 
+/// Return a process-wide `Gum` handle, initializing on first call.
+///
+/// `Gum::obtain()` must only be called once per process — Stalker corrupts
+/// Frida's internal GLib thread state, so a second `Gum::obtain()` crashes.
+#[cfg(feature = "frida")]
+fn frida_gum() -> &'static frida_gum::Gum {
+    use std::sync::OnceLock;
+    static GUM: OnceLock<frida_gum::Gum> = OnceLock::new();
+    GUM.get_or_init(frida_gum::Gum::obtain)
+}
+
 /// Check for BPF errors after a scheduler callback.
 ///
 /// If `ignore` is false and a BPF error is pending, takes the error message
@@ -1097,7 +1108,14 @@ impl<S: Scheduler> Simulator<S> {
 
         // Log interleaving mode
         if let Some(ref cfg) = state.preemptive {
-            if !cfg.cooperative_only {
+            let mode = if cfg.use_frida {
+                "Frida Stalker software RBC"
+            } else if cfg.cooperative_only {
+                "cooperative-only (no PMU)"
+            } else {
+                "PMU RBC timer"
+            };
+            if !cfg.cooperative_only && !cfg.use_frida {
                 warn!(
                     timeslice_min = cfg.timeslice_min,
                     timeslice_max = cfg.timeslice_max,
@@ -1111,7 +1129,8 @@ impl<S: Scheduler> Simulator<S> {
                 timeslice_max = cfg.timeslice_max,
                 cooperative_only = cfg.cooperative_only,
                 break_on = %cfg.break_on,
-                "preemptive interleaving enabled (PMU {} timer)", cfg.break_on
+                mode,
+                "preemptive interleaving enabled"
             );
         } else if state.interleave {
             info!("cooperative interleaving enabled (kfunc boundaries only)");
@@ -2948,38 +2967,79 @@ impl<S: Scheduler> Simulator<S> {
 
         let interleave_seed = state.next_prng();
 
-        if let Some(ref preemptive_cfg) = state.preemptive {
-            if let Some(ref trace) = state.replay_trace {
-                self.dispatch_concurrent_replay(
-                    &dispatch_cpus,
-                    &state_send,
-                    &sched_send,
-                    interleave_seed,
-                    trace,
-                );
+        // Choose the interleaving strategy for Phase 1.
+        //
+        // When the `frida` feature is compiled in and `use_frida` is set,
+        // use Frida Stalker software RBC instead of PMU hardware counters.
+        // This works in VMs/containers and provides exact branch counts
+        // with no PMU skid.
+        #[cfg(feature = "frida")]
+        let used_frida = if let Some(ref preemptive_cfg) = state.preemptive {
+            if preemptive_cfg.use_frida {
+                if let Some(range) = self.scheduler.text_range() {
+                    let gum = frida_gum();
+                    let text_range = crate::stalker::TextRange {
+                        base: range.0,
+                        size: range.1,
+                    };
+                    self.dispatch_concurrent_frida(
+                        &dispatch_cpus,
+                        &state_send,
+                        &sched_send,
+                        interleave_seed,
+                        preemptive_cfg.timeslice_min,
+                        preemptive_cfg.timeslice_max,
+                        gum,
+                        &text_range,
+                    );
+                    true
+                } else {
+                    false
+                }
             } else {
-                let timeslice_min = preemptive_cfg.timeslice_min;
-                let timeslice_max = preemptive_cfg.timeslice_max;
-                let cooperative_only = preemptive_cfg.cooperative_only;
-                let break_on = preemptive_cfg.break_on;
-                self.dispatch_concurrent_preemptive(
-                    &dispatch_cpus,
-                    &state_send,
-                    &sched_send,
-                    interleave_seed,
-                    timeslice_min,
-                    timeslice_max,
-                    cooperative_only,
-                    break_on,
-                );
+                false
             }
         } else {
-            self.dispatch_concurrent_cooperative(
-                &dispatch_cpus,
-                &state_send,
-                &sched_send,
-                interleave_seed,
-            );
+            false
+        };
+
+        #[cfg(not(feature = "frida"))]
+        let used_frida = false;
+
+        if !used_frida {
+            if let Some(ref preemptive_cfg) = state.preemptive {
+                if let Some(ref trace) = state.replay_trace {
+                    self.dispatch_concurrent_replay(
+                        &dispatch_cpus,
+                        &state_send,
+                        &sched_send,
+                        interleave_seed,
+                        trace,
+                    );
+                } else {
+                    let timeslice_min = preemptive_cfg.timeslice_min;
+                    let timeslice_max = preemptive_cfg.timeslice_max;
+                    let cooperative_only = preemptive_cfg.cooperative_only;
+                    let break_on = preemptive_cfg.break_on;
+                    self.dispatch_concurrent_preemptive(
+                        &dispatch_cpus,
+                        &state_send,
+                        &sched_send,
+                        interleave_seed,
+                        timeslice_min,
+                        timeslice_max,
+                        cooperative_only,
+                        break_on,
+                    );
+                }
+            } else {
+                self.dispatch_concurrent_cooperative(
+                    &dispatch_cpus,
+                    &state_send,
+                    &sched_send,
+                    interleave_seed,
+                );
+            }
         }
 
         // Phase 2: sequential post-processing on the engine thread.
@@ -3238,6 +3298,112 @@ impl<S: Scheduler> Simulator<S> {
         preempt::uninstall_replay_signal_handlers();
     }
 
+    /// Phase 1 Frida: run dispatch via `PreemptRing` + Frida Stalker.
+    ///
+    /// Each worker uses Frida's Stalker to instrument conditional branches
+    /// in the scheduler `.so`. A thread-local countdown is decremented at
+    /// each instrumented instruction; when it reaches zero, the worker
+    /// yields via the `PreemptRing`. No PMU timer or signal handler needed.
+    #[cfg(feature = "frida")]
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_concurrent_frida(
+        &self,
+        dispatch_cpus: &[CpuId],
+        state_send: &SendPtr<SimulatorState>,
+        sched_send: &SendPtr<S>,
+        seed: u32,
+        timeslice_min: u64,
+        timeslice_max: u64,
+        gum: &frida_gum::Gum,
+        text_range: &crate::stalker::TextRange,
+    ) {
+        use crate::interleave::WorkerId;
+        use crate::preempt::{self, PreemptRing};
+        use crate::stalker;
+
+        let ring = PreemptRing::new(dispatch_cpus.len(), seed);
+        let transformer = stalker::SyncTransformer::new(gum, text_range);
+        debug!(
+            workers = dispatch_cpus.len(),
+            timeslice_min,
+            timeslice_max,
+            seed,
+            text_base = %format_args!("0x{:x}", text_range.base),
+            text_size = text_range.size,
+            cpus = ?dispatch_cpus.iter().map(|c| c.0).collect::<Vec<_>>(),
+            "frida interleave: starting dispatch"
+        );
+
+        stalker::reset_counters();
+
+        std::thread::scope(|s| {
+            let ring_ref = &ring;
+            let state_ref = state_send;
+            let sched_ref = sched_send;
+            let transformer_ref = &transformer;
+
+            for (i, &cpu) in dispatch_cpus.iter().enumerate() {
+                let worker_id = WorkerId(i);
+
+                s.spawn(move || {
+                    let sp = state_ref.0;
+                    let schp = sched_ref.0 as *const S;
+
+                    let mut stalker_inst = frida_gum::stalker::Stalker::new(gum);
+
+                    // Install with timer_fd=-1 (no PMU timer).
+                    preempt::install(
+                        ring_ref,
+                        worker_id,
+                        -1, // no PMU timer fd
+                        -1, // no measure fd
+                        timeslice_min,
+                        timeslice_max,
+                    );
+
+                    ring_ref.wait_for_token(worker_id);
+
+                    // Enter sim AFTER acquiring the token to avoid racing on
+                    // SimulatorState.current_cpu with other workers.
+                    unsafe { kfuncs::enter_sim(&mut *sp, cpu) };
+
+                    // Arm software RBC and start Stalker before entering
+                    // scheduler C code.
+                    let ts = ring_ref.roll_timeslice(timeslice_min, timeslice_max);
+                    stalker::arm_software_rbc(ts, text_range.base as u64);
+                    stalker_inst
+                        .follow_me::<frida_gum::stalker::NoneEventSink>(&transformer_ref.0, None);
+
+                    unsafe {
+                        stalker::begin_structop();
+                        debug!(cpu = cpu.0, "dispatch (frida)");
+                        dispatch_worker_body(sp, schp, cpu);
+                    }
+
+                    // Unfollow and disarm after scheduler dispatch returns.
+                    stalker_inst.unfollow_me();
+                    stalker::disarm_software_rbc();
+
+                    ring_ref.finish(worker_id);
+                    kfuncs::exit_sim();
+                    preempt::uninstall();
+                });
+            }
+
+            ring.start();
+            ring.wait_all_done();
+        });
+
+        debug!(
+            signal_preemptions = ring.signal_preemptions(),
+            cooperative_yields = ring.cooperative_yields(),
+            stalker_callouts = stalker::total_callouts(),
+            "frida interleave: dispatch complete"
+        );
+
+        stalker::reset_counters();
+    }
+
     /// Phase 1 preemptive: run dispatch via `PreemptRing` + PMU timer.
     ///
     /// Each worker yields at kfunc boundaries (cooperative) AND is also
@@ -3303,11 +3469,23 @@ impl<S: Scheduler> Simulator<S> {
                     } else if timer_fd >= 0 {
                         debug!(worker = i, cpu = cpu.0, %break_on, "preempt: PMU timer armed");
                     } else {
-                        debug!(
-                            worker = i,
-                            cpu = cpu.0,
-                            "preempt: PMU unavailable, cooperative-only"
-                        );
+                        // PMU unavailable: warn louder in determinism mode
+                        // since PMU skid makes deterministic replay impossible.
+                        if is_determinism_mode_enabled() {
+                            tracing::warn!(
+                                worker = i,
+                                cpu = cpu.0,
+                                "WARNING: PMU unavailable in determinism mode. \
+                                 Falling back to cooperative-only interleaving. \
+                                 Rebuild with --features frida for exact counts."
+                            );
+                        } else {
+                            debug!(
+                                worker = i,
+                                cpu = cpu.0,
+                                "preempt: PMU unavailable, cooperative-only"
+                            );
+                        }
                     }
                     preempt::install(
                         ring_ref,
@@ -3478,26 +3656,91 @@ impl<S: Scheduler> Simulator<S> {
         let cgroup_send = SendPtr(cgroup_registry as *mut CgroupRegistry);
 
         if let Some(ref preemptive_cfg) = state.preemptive.clone() {
-            Self::process_batch_concurrent_preemptive(
-                per_cpu,
-                &cpu_ids,
-                &sim_send,
-                &state_send,
-                &tasks_send,
-                &events_send,
-                &cgroup_send,
-                interleave_seed,
-                watchdog_timeout,
-                duration_ns,
-                max_cgroups,
-                preemptive_cfg.timeslice_min,
-                preemptive_cfg.timeslice_max,
-                preemptive_cfg.cooperative_only,
-                preemptive_cfg.break_on,
-            );
+            // When Frida is enabled, use Stalker software RBC instead of
+            // PMU hardware counters. This provides deterministic preemption
+            // without hardware PMU support.
+            //
+            // Optimization: skip Stalker when the batch contains only Tick
+            // events and the scheduler doesn't implement `tick`. In that
+            // case no scheduler `.so` code will execute, so Stalker DBI
+            // overhead is wasted (zero callouts). Fall back to cooperative
+            // interleaving which is sufficient since kfunc boundaries
+            // provide natural yield points.
+            #[cfg(feature = "frida")]
+            let used_frida = if preemptive_cfg.use_frida {
+                let all_ticks = per_cpu
+                    .values()
+                    .flat_map(|v| v.iter())
+                    .all(|e| matches!(e.kind, EventKind::Tick { .. }));
+                let skip_frida = all_ticks && !self.scheduler.has_tick();
+                if skip_frida {
+                    debug!(
+                        workers = cpu_ids.len(),
+                        "batch-concurrent frida: skipping (tick-only batch, scheduler has no tick)"
+                    );
+                    false
+                } else if let Some(range) = self.scheduler.text_range() {
+                    let gum = frida_gum();
+                    let text_range = crate::stalker::TextRange {
+                        base: range.0,
+                        size: range.1,
+                    };
+                    Self::process_batch_concurrent_frida(
+                        &per_cpu,
+                        &cpu_ids,
+                        &sim_send,
+                        &state_send,
+                        &tasks_send,
+                        &events_send,
+                        &cgroup_send,
+                        interleave_seed,
+                        watchdog_timeout,
+                        duration_ns,
+                        max_cgroups,
+                        preemptive_cfg.timeslice_min,
+                        preemptive_cfg.timeslice_max,
+                        &text_range,
+                        gum,
+                    );
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            #[cfg(not(feature = "frida"))]
+            let used_frida = false;
+
+            if !used_frida {
+                Self::process_batch_concurrent_preemptive(
+                    &per_cpu,
+                    &cpu_ids,
+                    &sim_send,
+                    &state_send,
+                    &tasks_send,
+                    &events_send,
+                    &cgroup_send,
+                    interleave_seed,
+                    watchdog_timeout,
+                    duration_ns,
+                    max_cgroups,
+                    preemptive_cfg.timeslice_min,
+                    preemptive_cfg.timeslice_max,
+                    // Force cooperative-only for batch processing: PMU
+                    // signals introduce hardware-dependent skid. Batch
+                    // handlers already have cooperative yield points at
+                    // every kfunc boundary. PMU-based preemption is
+                    // reserved for dispatch_concurrent where the tight
+                    // C loop has no natural yield points.
+                    true,
+                    preemptive_cfg.break_on,
+                );
+            }
         } else {
             Self::process_batch_concurrent_cooperative(
-                per_cpu,
+                &per_cpu,
                 &cpu_ids,
                 &sim_send,
                 &state_send,
@@ -3521,7 +3764,7 @@ impl<S: Scheduler> Simulator<S> {
     /// Cooperative batch-concurrent processing via `TokenRing`.
     #[allow(clippy::too_many_arguments)]
     fn process_batch_concurrent_cooperative(
-        per_cpu: HashMap<CpuId, Vec<Event>>,
+        per_cpu: &HashMap<CpuId, Vec<Event>>,
         cpu_ids: &[CpuId],
         sim_send: &SendPtr<Simulator<S>>,
         state_send: &SendPtr<SimulatorState>,
@@ -3544,7 +3787,7 @@ impl<S: Scheduler> Simulator<S> {
             let tasks_ref = tasks_send;
             let events_ref = events_send;
             let cgroup_ref = cgroup_send;
-            let per_cpu_ref = &per_cpu;
+            let per_cpu_ref = per_cpu;
 
             for (i, &cpu) in cpu_ids.iter().enumerate() {
                 let worker_id = WorkerId(i);
@@ -3609,7 +3852,7 @@ impl<S: Scheduler> Simulator<S> {
     /// Preemptive batch-concurrent processing via `PreemptRing` + PMU timer.
     #[allow(clippy::too_many_arguments)]
     fn process_batch_concurrent_preemptive(
-        per_cpu: HashMap<CpuId, Vec<Event>>,
+        per_cpu: &HashMap<CpuId, Vec<Event>>,
         cpu_ids: &[CpuId],
         sim_send: &SendPtr<Simulator<S>>,
         state_send: &SendPtr<SimulatorState>,
@@ -3638,7 +3881,7 @@ impl<S: Scheduler> Simulator<S> {
             let tasks_ref = tasks_send;
             let events_ref = events_send;
             let cgroup_ref = cgroup_send;
-            let per_cpu_ref = &per_cpu;
+            let per_cpu_ref = per_cpu;
 
             for (i, &cpu) in cpu_ids.iter().enumerate() {
                 let worker_id = WorkerId(i);
@@ -3746,6 +3989,122 @@ impl<S: Scheduler> Simulator<S> {
             "batch-concurrent preemptive: complete"
         );
         preempt::uninstall_signal_handler();
+    }
+
+    /// Frida Stalker batch-concurrent processing via `PreemptRing`.
+    ///
+    /// Like [`process_batch_concurrent_preemptive`], but uses Frida Stalker
+    /// dynamic binary instrumentation instead of PMU hardware counters.
+    /// Each worker instruments conditional branches in the scheduler `.so`
+    /// and yields when a software counter expires. No signal handler needed.
+    #[cfg(feature = "frida")]
+    #[allow(clippy::too_many_arguments)]
+    fn process_batch_concurrent_frida(
+        per_cpu: &HashMap<CpuId, Vec<Event>>,
+        cpu_ids: &[CpuId],
+        sim_send: &SendPtr<Simulator<S>>,
+        state_send: &SendPtr<SimulatorState>,
+        tasks_send: &SendPtr<HashMap<Pid, SimTask>>,
+        events_send: &SendPtr<EventQueue>,
+        cgroup_send: &SendPtr<CgroupRegistry>,
+        seed: u32,
+        watchdog_timeout: Option<TimeNs>,
+        duration_ns: TimeNs,
+        max_cgroups: u32,
+        timeslice_min: u64,
+        timeslice_max: u64,
+        text_range: &crate::stalker::TextRange,
+        gum: &frida_gum::Gum,
+    ) {
+        use crate::interleave::WorkerId;
+        use crate::preempt::{self, PreemptRing};
+        use crate::stalker;
+
+        let ring = PreemptRing::new(cpu_ids.len(), seed);
+        let transformer = stalker::SyncTransformer::new(gum, text_range);
+        stalker::reset_counters();
+
+        debug!(
+            workers = cpu_ids.len(),
+            timeslice_min,
+            timeslice_max,
+            text_base = %format_args!("0x{:x}", text_range.base),
+            text_size = text_range.size,
+            "batch-concurrent frida: starting"
+        );
+
+        std::thread::scope(|s| {
+            let ring_ref = &ring;
+            let sim_ref = sim_send;
+            let state_ref = state_send;
+            let tasks_ref = tasks_send;
+            let events_ref = events_send;
+            let cgroup_ref = cgroup_send;
+            let per_cpu_ref = per_cpu;
+            let transformer_ref = &transformer;
+
+            for (i, &cpu) in cpu_ids.iter().enumerate() {
+                let worker_id = WorkerId(i);
+                let cpu_events = per_cpu_ref.get(&cpu).cloned().unwrap_or_default();
+
+                s.spawn(move || {
+                    let simp = sim_ref.0 as *const Simulator<S>;
+                    let sp = state_ref.0;
+
+                    let mut stalker_inst = frida_gum::stalker::Stalker::new(gum);
+
+                    // Install with timer_fd=-1 (no PMU timer).
+                    preempt::install(ring_ref, worker_id, -1, -1, timeslice_min, timeslice_max);
+
+                    ring_ref.wait_for_token(worker_id);
+
+                    // Enter sim AFTER acquiring the token.
+                    unsafe { kfuncs::enter_sim(&mut *sp, cpu) };
+
+                    // Arm software RBC and start Stalker before processing.
+                    let ts = ring_ref.roll_timeslice(timeslice_min, timeslice_max);
+                    stalker::arm_software_rbc(ts, text_range.base as u64);
+                    stalker_inst
+                        .follow_me::<frida_gum::stalker::NoneEventSink>(&transformer_ref.0, None);
+
+                    // Process all events for this CPU.
+                    // NOTE: No eprintln!/println! inside this section —
+                    // stdio locks under Stalker DBI can deadlock.
+                    unsafe {
+                        batch_worker_body(
+                            simp,
+                            sp,
+                            tasks_ref.0,
+                            events_ref.0,
+                            cgroup_ref.0,
+                            cpu_events,
+                            watchdog_timeout,
+                            duration_ns,
+                            max_cgroups,
+                        );
+                    }
+
+                    stalker_inst.unfollow_me();
+                    stalker::disarm_software_rbc();
+
+                    ring_ref.finish(worker_id);
+                    kfuncs::exit_sim();
+                    preempt::uninstall();
+                });
+            }
+
+            ring.start();
+            ring.wait_all_done();
+        });
+
+        debug!(
+            signal_preemptions = ring.signal_preemptions(),
+            cooperative_yields = ring.cooperative_yields(),
+            stalker_callouts = stalker::total_callouts(),
+            deferred_yields = stalker::deferred_yields(),
+            workers = cpu_ids.len(),
+            "batch-concurrent frida: complete"
+        );
     }
 
     /// Process CPUs kicked via `scx_bpf_kick_cpu` during a callback.
