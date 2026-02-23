@@ -850,6 +850,7 @@ impl<S: Scheduler> Simulator<S> {
             bpf_error: None,
             interleave: scenario.interleave,
             preemptive: scenario.preemptive.clone(),
+            replay_trace: scenario.replay_trace.clone(),
             structop_accum: vec![
                 crate::preempt::StructopInfo::default();
                 scenario.nr_cpus as usize
@@ -2948,20 +2949,30 @@ impl<S: Scheduler> Simulator<S> {
         let interleave_seed = state.next_prng();
 
         if let Some(ref preemptive_cfg) = state.preemptive {
-            let timeslice_min = preemptive_cfg.timeslice_min;
-            let timeslice_max = preemptive_cfg.timeslice_max;
-            let cooperative_only = preemptive_cfg.cooperative_only;
-            let break_on = preemptive_cfg.break_on;
-            self.dispatch_concurrent_preemptive(
-                &dispatch_cpus,
-                &state_send,
-                &sched_send,
-                interleave_seed,
-                timeslice_min,
-                timeslice_max,
-                cooperative_only,
-                break_on,
-            );
+            if let Some(ref trace) = state.replay_trace {
+                self.dispatch_concurrent_replay(
+                    &dispatch_cpus,
+                    &state_send,
+                    &sched_send,
+                    interleave_seed,
+                    trace,
+                );
+            } else {
+                let timeslice_min = preemptive_cfg.timeslice_min;
+                let timeslice_max = preemptive_cfg.timeslice_max;
+                let cooperative_only = preemptive_cfg.cooperative_only;
+                let break_on = preemptive_cfg.break_on;
+                self.dispatch_concurrent_preemptive(
+                    &dispatch_cpus,
+                    &state_send,
+                    &sched_send,
+                    interleave_seed,
+                    timeslice_min,
+                    timeslice_max,
+                    cooperative_only,
+                    break_on,
+                );
+            }
         } else {
             self.dispatch_concurrent_cooperative(
                 &dispatch_cpus,
@@ -3069,6 +3080,162 @@ impl<S: Scheduler> Simulator<S> {
             ring.start();
             ring.wait_all_done();
         });
+    }
+
+    /// Phase 1 replay: run dispatch using a recorded preemption trace.
+    ///
+    /// Instead of random PMU timeslices, each worker follows its recorded
+    /// trace of preemption points using the hybrid PMU + hardware breakpoint
+    /// approach: the PMU timer fires when we're within REPLAY_MARGIN of the
+    /// target RBC count, then a hardware breakpoint catches the exact
+    /// instruction pointer.
+    ///
+    /// Falls back to cooperative-only if PMU or hardware breakpoints are
+    /// unavailable.
+    fn dispatch_concurrent_replay(
+        &self,
+        dispatch_cpus: &[CpuId],
+        state_send: &SendPtr<SimulatorState>,
+        sched_send: &SendPtr<S>,
+        seed: u32,
+        trace: &crate::preempt::trace::PreemptionTrace,
+    ) {
+        use crate::interleave::WorkerId;
+        use crate::preempt::{self, PreemptRing, ReplayCursor};
+
+        let ring = PreemptRing::new(dispatch_cpus.len(), seed);
+        debug!(
+            workers = dispatch_cpus.len(),
+            seed,
+            total_preemptions = trace.len(),
+            cpus = ?dispatch_cpus.iter().map(|c| c.0).collect::<Vec<_>>(),
+            "replay interleave: starting dispatch"
+        );
+        preempt::install_replay_signal_handlers();
+        preempt::reset_structop_globals();
+
+        // Build per-worker cursors from the trace.
+        let cursors: Vec<ReplayCursor> = (0..dispatch_cpus.len())
+            .map(|i| {
+                let targets = trace.worker_trace(WorkerId(i)).to_vec();
+                ReplayCursor::new(targets)
+            })
+            .collect();
+
+        std::thread::scope(|s| {
+            let ring_ref = &ring;
+            let state_ref = state_send;
+            let sched_ref = sched_send;
+            let cursors_ref = &cursors;
+
+            for (i, &cpu) in dispatch_cpus.iter().enumerate() {
+                let worker_id = WorkerId(i);
+
+                s.spawn(move || {
+                    let sp = state_ref.0;
+                    let schp = sched_ref.0 as *const S;
+                    let cursor = &cursors_ref[i];
+
+                    // Create per-thread PMU timer.
+                    let (timer, timer_fd) = setup_pmu_timer(false, trace.break_on());
+
+                    // Create per-thread hardware breakpoint (at dummy addr 0x1).
+                    let bp_fd = {
+                        let bp = perf::try_create_hw_breakpoint(0x1);
+                        match bp {
+                            Some(b) => {
+                                let fd = b.raw_fd();
+                                // Leak the bp so the fd stays open; we manage
+                                // the fd lifetime manually via raw ioctls.
+                                std::mem::forget(b);
+                                fd
+                            }
+                            None => {
+                                tracing::warn!(
+                                    worker = i,
+                                    "replay: HW breakpoint unavailable, \
+                                     cooperative-only fallback"
+                                );
+                                -1
+                            }
+                        }
+                    };
+
+                    if timer_fd >= 0 && bp_fd >= 0 {
+                        debug!(
+                            worker = i,
+                            cpu = cpu.0,
+                            targets = cursor.len(),
+                            "replay: PMU + breakpoint armed"
+                        );
+                    } else {
+                        debug!(
+                            worker = i,
+                            cpu = cpu.0,
+                            targets = cursor.len(),
+                            "replay: cooperative-only (PMU or BP unavailable)"
+                        );
+                    }
+
+                    // Install replay context (replaces normal preempt context).
+                    preempt::install_replay(ring_ref, worker_id, timer_fd, bp_fd, cursor);
+
+                    ring_ref.wait_for_token(worker_id);
+
+                    unsafe { kfuncs::enter_sim(&mut *sp, cpu) };
+
+                    // Arm PMU timer for the first replay target.
+                    if timer_fd >= 0 && bp_fd >= 0 {
+                        if let Some(first) = cursor.current_target() {
+                            preempt::arm_replay_timer_pub(timer_fd, first.rbc_count);
+                        }
+                    }
+
+                    unsafe {
+                        let sim = &mut *sp;
+                        sim.current_cpu = cpu;
+                        sim.ops_context = OpsContext::Dispatch;
+
+                        let prev_pid = sim.cpus[cpu.0 as usize].prev_task;
+                        let prev_raw = prev_pid
+                            .and_then(|pid| sim.task_pid_to_raw.get(&pid).copied())
+                            .map_or(std::ptr::null_mut(), |raw| raw as *mut c_void);
+
+                        debug!(cpu = cpu.0, "dispatch (replay)");
+                        (*schp).dispatch(cpu.0 as i32, prev_raw);
+                        sim.ops_context = OpsContext::None;
+                        sim.resolve_pending_dispatch(cpu);
+                    }
+
+                    // Disable timer and breakpoint before finishing.
+                    if let Some(ref t) = timer {
+                        let _ = t.disable();
+                    }
+                    if bp_fd >= 0 {
+                        unsafe {
+                            libc::ioctl(bp_fd, scx_perf::PERF_IOC_DISABLE, 0 as libc::c_ulong);
+                            libc::close(bp_fd);
+                        }
+                    }
+
+                    preempt::reset_structop_cpu_count();
+                    ring_ref.finish(worker_id);
+                    kfuncs::exit_sim();
+                    preempt::uninstall_replay();
+                    // timer dropped here — closes the perf fd
+                });
+            }
+
+            ring.start();
+            ring.wait_all_done();
+        });
+
+        debug!(
+            signal_preemptions = ring.signal_preemptions(),
+            cooperative_yields = ring.cooperative_yields(),
+            "replay interleave: dispatch complete"
+        );
+        preempt::uninstall_replay_signal_handlers();
     }
 
     /// Phase 1 preemptive: run dispatch via `PreemptRing` + PMU timer.

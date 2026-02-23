@@ -238,6 +238,12 @@ pub struct SimulatorState {
     pub interleave: bool,
     /// Preemptive interleaving configuration (None = disabled).
     pub preemptive: Option<PreemptiveConfig>,
+    /// Optional preemption trace for replay mode.
+    ///
+    /// When set, preemptive dispatch uses the recorded trace instead of
+    /// random PMU timeslices, enabling exact reproduction of preemption
+    /// points via hardware breakpoints.
+    pub replay_trace: Option<crate::preempt::trace::PreemptionTrace>,
     /// Per-CPU structop accumulators that persist across dispatch rounds.
     /// Indexed by CpuId.0. Seeded into worker thread-locals at the start
     /// of each dispatch round and drained back at the end.
@@ -1739,6 +1745,7 @@ mod tests {
             bpf_error: None,
             interleave: false,
             preemptive: None,
+            replay_trace: None,
             structop_accum: vec![crate::preempt::StructopInfo::default(); nr_cpus as usize],
             in_concurrent_batch: false,
         }

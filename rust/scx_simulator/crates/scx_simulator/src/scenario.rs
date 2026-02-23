@@ -484,6 +484,12 @@ pub struct Scenario {
     /// `interleave = true`. When the PMU is unavailable (VMs, containers),
     /// falls back to cooperative-only interleaving with the PreemptRing.
     pub preemptive: Option<PreemptiveConfig>,
+    /// Optional preemption trace for replay mode.
+    ///
+    /// When set, preemptive dispatch uses the recorded trace instead of
+    /// random PMU timeslices, enabling exact reproduction of preemption
+    /// points via hardware breakpoints.
+    pub replay_trace: Option<crate::preempt::trace::PreemptionTrace>,
     /// Maximum number of cgroups that can have BPF map entries allocated.
     ///
     /// This simulates BPF hash map capacity limits. In production LAVD,
@@ -520,6 +526,7 @@ pub struct ScenarioBuilder {
     cgroup_cpuset_change_events: Vec<CgroupCpusetChangeEvent>,
     interleave: bool,
     preemptive: Option<PreemptiveConfig>,
+    replay_trace: Option<crate::preempt::trace::PreemptionTrace>,
     max_cgroups: u32,
     irq_events: Vec<IrqEvent>,
 }
@@ -548,6 +555,7 @@ impl Scenario {
             cgroup_cpuset_change_events: Vec::new(),
             interleave: false,
             preemptive: None,
+            replay_trace: None,
             max_cgroups: DEFAULT_MAX_CGROUPS,
             irq_events: Vec::new(),
         }
@@ -928,6 +936,16 @@ impl ScenarioBuilder {
         self
     }
 
+    /// Set a preemption trace for replay mode.
+    ///
+    /// When set, preemptive dispatch uses the recorded trace instead of
+    /// random PMU timeslices, enabling exact reproduction of preemption
+    /// points via hardware breakpoints.
+    pub fn replay_trace(mut self, trace: crate::preempt::trace::PreemptionTrace) -> Self {
+        self.replay_trace = Some(trace);
+        self
+    }
+
     /// Set the maximum number of cgroups that can have BPF map entries.
     ///
     /// This simulates BPF hash map capacity limits. In production LAVD,
@@ -1048,6 +1066,7 @@ impl ScenarioBuilder {
             cgroup_cpuset_change_events: self.cgroup_cpuset_change_events,
             interleave: self.interleave,
             preemptive: self.preemptive,
+            replay_trace: self.replay_trace,
             max_cgroups: self.max_cgroups,
             irq_events: self.irq_events,
         }
