@@ -166,11 +166,12 @@ branches are lightweight local branches for parallel agent work.
 Work Branches (`work/*`)
 ----------------------------------------
 
-**`work/*` branches are LOCAL ONLY.** Never push them to remote. They exist
-solely to satisfy the worktree one-branch-per-directory constraint.
+**`work/*` branches are LOCAL ONLY and TRANSIENT.** Never push them to remote. 
+They exist solely to satisfy the worktree one-branch-per-directory constraint.
 
-When work on a `work/*` branch is ready, merge it back to the target branch
-using a **fast-forward only merge**:
+When work on a `work/*` branch is ready, basically as soon as it is
+committed, merge it back to the target branch using a **fast-forward
+only merge**:
 
 ```bash
 # From scx1 (on simulator.v3):
