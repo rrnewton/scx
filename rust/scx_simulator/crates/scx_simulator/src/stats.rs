@@ -286,63 +286,63 @@ impl TraceStats {
         stats
     }
 
-    /// Print a summary report to stderr.
+    /// Print a summary report to stdout.
     pub fn print_summary(&self) {
-        eprintln!("\n=== Trace Statistics ===\n");
-        eprintln!("Duration: {:.3}ms", self.duration_ns as f64 / 1_000_000.0);
-        eprintln!();
+        println!("\n=== Trace Statistics ===\n");
+        println!("Duration: {:.3}ms", self.duration_ns as f64 / 1_000_000.0);
+        println!();
 
-        eprintln!("--- Per-Task Statistics ---");
+        println!("--- Per-Task Statistics ---");
         let mut task_pids: Vec<_> = self.tasks.keys().copied().collect();
         task_pids.sort_by_key(|p| p.0);
 
         for pid in task_pids {
             let ts = &self.tasks[&pid];
-            eprintln!("  Task PID={}:", pid.0);
-            eprintln!("    Schedules:       {}", ts.schedule_count);
-            eprintln!(
+            println!("  Task PID={}:", pid.0);
+            println!("    Schedules:       {}", ts.schedule_count);
+            println!(
                 "    Run duration:    {:.3}ms mean, {:.3}ms stddev, CV={:.1}%",
                 ts.run_duration.mean() / 1_000_000.0,
                 ts.run_duration.stddev() / 1_000_000.0,
                 ts.run_duration.cv_percent()
             );
-            eprintln!(
+            println!(
                 "    Inter-arrival:   {:.3}ms mean, {:.3}ms stddev",
                 ts.inter_arrival.mean() / 1_000_000.0,
                 ts.inter_arrival.stddev() / 1_000_000.0
             );
-            eprintln!("    Direct dispatch: {}", ts.direct_dispatch_count);
-            eprintln!("    Enqueue calls:   {}", ts.enqueue_count);
-            eprintln!("    Yields:          {}", ts.yield_count);
-            eprintln!("    Preemptions:     {}", ts.preempt_count);
-            eprintln!("    Sleeps:          {}", ts.sleep_count);
+            println!("    Direct dispatch: {}", ts.direct_dispatch_count);
+            println!("    Enqueue calls:   {}", ts.enqueue_count);
+            println!("    Yields:          {}", ts.yield_count);
+            println!("    Preemptions:     {}", ts.preempt_count);
+            println!("    Sleeps:          {}", ts.sleep_count);
         }
-        eprintln!();
+        println!();
 
-        eprintln!("--- Per-CPU Statistics ---");
+        println!("--- Per-CPU Statistics ---");
         let mut cpu_ids: Vec<_> = self.cpus.keys().copied().collect();
         cpu_ids.sort_by_key(|c| c.0);
 
         for cpu in cpu_ids {
             let cs = &self.cpus[&cpu];
-            eprintln!("  CPU {}:", cpu.0);
-            eprintln!("    Ticks:         {}", cs.tick_count);
-            eprintln!(
+            println!("  CPU {}:", cpu.0);
+            println!("    Ticks:         {}", cs.tick_count);
+            println!(
                 "    Tick interval: {:.3}ms mean, {:.3}ms stddev",
                 cs.tick_interval.mean() / 1_000_000.0,
                 cs.tick_interval.stddev() / 1_000_000.0
             );
-            eprintln!("    Balance calls: {}", cs.balance_count);
-            eprintln!("    Idle events:   {}", cs.idle_count);
+            println!("    Balance calls: {}", cs.balance_count);
+            println!("    Idle events:   {}", cs.idle_count);
         }
-        eprintln!();
+        println!();
 
-        eprintln!("--- Global Statistics ---");
-        eprintln!("  DSQ inserts (FIFO):    {}", self.dsq_insert_count);
-        eprintln!("  DSQ inserts (vtime):   {}", self.dsq_insert_vtime_count);
-        eprintln!("  DSQ move_to_local:     {}", self.dsq_move_to_local_count);
-        eprintln!("  Kick CPU calls:        {}", self.kick_cpu_count);
-        eprintln!();
+        println!("--- Global Statistics ---");
+        println!("  DSQ inserts (FIFO):    {}", self.dsq_insert_count);
+        println!("  DSQ inserts (vtime):   {}", self.dsq_insert_vtime_count);
+        println!("  DSQ move_to_local:     {}", self.dsq_move_to_local_count);
+        println!("  Kick CPU calls:        {}", self.kick_cpu_count);
+        println!();
     }
 
     /// Compute a realism score based on known gap indicators.

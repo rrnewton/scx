@@ -206,6 +206,14 @@ struct Cli {
     /// can be used for deterministic replay.
     #[arg(long, value_name = "PATH")]
     record_preemptions: Option<PathBuf>,
+
+    /// Print detailed per-task and per-CPU statistics after simulation.
+    ///
+    /// By default, only a brief trace summary is printed. This flag
+    /// enables the verbose breakdown with distribution stats, run
+    /// durations, inter-arrival times, and per-CPU tick intervals.
+    #[arg(long)]
+    verbose_summary: bool,
 }
 
 fn main() {
@@ -433,10 +441,6 @@ fn run_simulation(cli: &Cli, scenario: scx_simulator::Scenario) -> Result<(), St
 
     let trace = Simulator::new(sched).run(scenario);
 
-    // Print end-of-simulation summary.
-    let stats = TraceStats::from_trace(&trace);
-    stats.print_summary();
-
     if cli.dump_trace {
         trace.dump();
     }
@@ -467,6 +471,14 @@ fn run_simulation(cli: &Cli, scenario: scx_simulator::Scenario) -> Result<(), St
             preemption_trace.len(),
             path.display()
         );
+    }
+
+    // Print simulation summary.
+    if cli.verbose_summary {
+        let stats = TraceStats::from_trace(&trace);
+        stats.print_summary();
+    } else {
+        println!("{}", trace.summary());
     }
 
     if trace.has_error() {
