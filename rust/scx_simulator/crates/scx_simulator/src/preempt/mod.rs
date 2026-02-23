@@ -43,7 +43,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering:
 use std::sync::Mutex;
 
 use crate::interleave::WorkerId;
-use crate::kfuncs::SimulatorState;
+use crate::kfuncs::{OpsContext, SimulatorState};
 use crate::types::CpuId;
 
 pub mod trace;
@@ -82,14 +82,24 @@ pub struct PreemptionRecord {
     pub structop_global: u64,
     /// Cumulative RBC within the current structop at the time of preemption.
     pub structop_rbc: u64,
+    /// Which ops callback was active at the time of preemption.
+    pub ops_context: OpsContext,
+    /// Name of the kfunc being called (empty if unknown or PMU preemption).
+    pub kfunc_name: &'static str,
 }
 
 impl std::fmt::Display for PreemptionRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "seq={} structop={}:{} rbc={} rip=0x{:x} cpu={} worker={}",
+            "seq={} ops={} kfunc={} structop={}:{} rbc={} rip=0x{:x} cpu={} worker={}",
             self.sequence,
+            self.ops_context.short_name(),
+            if self.kfunc_name.is_empty() {
+                "-"
+            } else {
+                self.kfunc_name
+            },
             self.structop_local,
             self.structop_global,
             self.structop_rbc,
@@ -101,7 +111,7 @@ impl std::fmt::Display for PreemptionRecord {
 }
 
 /// Number of AtomicU64 slots per preemption record.
-const RECORD_FIELDS: usize = 8;
+const RECORD_FIELDS: usize = 11;
 
 /// Global monotonic sequence counter shared across all `PreemptionRecordStore`
 /// instances. Ensures unique, globally-ordered sequence numbers even when
@@ -168,6 +178,10 @@ impl PreemptionRecordStore {
         self.records[base + 5].store(sinfo.cpu_count, SeqCst);
         self.records[base + 6].store(sinfo.global_count, SeqCst);
         self.records[base + 7].store(sinfo.rbc_total, SeqCst);
+        self.records[base + 8].store(sinfo.ops_context as u8 as u64, SeqCst);
+        // Store kfunc_name as ptr+len — safe because all names are &'static str.
+        self.records[base + 9].store(sinfo.kfunc_name.as_ptr() as u64, SeqCst);
+        self.records[base + 10].store(sinfo.kfunc_name.len() as u64, SeqCst);
         Some(seq)
     }
 
@@ -177,6 +191,20 @@ impl PreemptionRecordStore {
         let mut records = Vec::with_capacity(count);
         for i in 0..count {
             let base = i * RECORD_FIELDS;
+            let ops_disc = self.records[base + 8].load(SeqCst) as u8;
+            let kfunc_ptr = self.records[base + 9].load(SeqCst) as usize;
+            let kfunc_len = self.records[base + 10].load(SeqCst) as usize;
+            // SAFETY: kfunc_name was a &'static str, so ptr+len is valid.
+            let kfunc_name = if kfunc_ptr != 0 && kfunc_len > 0 {
+                unsafe {
+                    std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                        kfunc_ptr as *const u8,
+                        kfunc_len,
+                    ))
+                }
+            } else {
+                ""
+            };
             records.push(PreemptionRecord {
                 rbc_count: self.records[base].load(SeqCst),
                 instruction_pointer: self.records[base + 1].load(SeqCst),
@@ -186,6 +214,8 @@ impl PreemptionRecordStore {
                 structop_local: self.records[base + 5].load(SeqCst),
                 structop_global: self.records[base + 6].load(SeqCst),
                 structop_rbc: self.records[base + 7].load(SeqCst),
+                ops_context: OpsContext::from_discriminant(ops_disc),
+                kfunc_name,
             });
         }
         // Sort by sequence number to ensure deterministic ordering.
@@ -668,6 +698,8 @@ fn futex_wake(futex: &AtomicU32, count: i32) {
 /// - `global_count`: how many structops all CPUs have entered
 /// - `rbc_total`: cumulative retired conditional branches on this CPU
 /// - `kfunc_count`: cumulative cooperative yields on this CPU
+/// - `ops_context`: which ops callback is currently active
+/// - `kfunc_name`: name of the kfunc about to be called
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StructopInfo {
     /// Per-CPU structop call count (monotonically increasing).
@@ -678,6 +710,10 @@ pub struct StructopInfo {
     pub rbc_total: u64,
     /// Cumulative cooperative yield count on this CPU (monotonically increasing).
     pub kfunc_count: u64,
+    /// Which ops callback is currently active.
+    pub ops_context: OpsContext,
+    /// Name of the kfunc about to be called (empty string if unknown).
+    pub kfunc_name: &'static str,
 }
 
 thread_local! {
@@ -685,6 +721,10 @@ thread_local! {
     static STRUCTOP_RBC_TOTAL: Cell<u64> = const { Cell::new(0) };
     static STRUCTOP_KFUNC_COUNT: Cell<u64> = const { Cell::new(0) };
     static IN_STRUCTOP: Cell<bool> = const { Cell::new(false) };
+    /// Current kfunc name, set before each `maybe_yield()` call.
+    static CURRENT_KFUNC_NAME: Cell<&'static str> = const { Cell::new("") };
+    /// Current ops context, cached from SimulatorState at structop boundary.
+    static CURRENT_OPS_CONTEXT: Cell<OpsContext> = const { Cell::new(OpsContext::None) };
 }
 static STRUCTOP_GLOBAL_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -695,6 +735,8 @@ pub fn seed_structop(base: &StructopInfo) {
     STRUCTOP_RBC_TOTAL.with(|c| c.set(base.rbc_total));
     STRUCTOP_KFUNC_COUNT.with(|c| c.set(base.kfunc_count));
     IN_STRUCTOP.with(|c| c.set(false));
+    CURRENT_KFUNC_NAME.with(|c| c.set(""));
+    CURRENT_OPS_CONTEXT.with(|c| c.set(OpsContext::None));
 }
 
 /// Begin a new structop: increment per-CPU and global counts.
@@ -710,6 +752,8 @@ pub fn structop_info() -> StructopInfo {
         global_count: STRUCTOP_GLOBAL_COUNT.load(SeqCst),
         rbc_total: STRUCTOP_RBC_TOTAL.with(|c| c.get()),
         kfunc_count: STRUCTOP_KFUNC_COUNT.with(|c| c.get()),
+        ops_context: CURRENT_OPS_CONTEXT.with(|c| c.get()),
+        kfunc_name: CURRENT_KFUNC_NAME.with(|c| c.get()),
     }
 }
 
@@ -747,11 +791,34 @@ pub fn reset_structop_cpu_count() {
     STRUCTOP_RBC_TOTAL.with(|c| c.set(0));
     STRUCTOP_KFUNC_COUNT.with(|c| c.set(0));
     IN_STRUCTOP.with(|c| c.set(false));
+    CURRENT_KFUNC_NAME.with(|c| c.set(""));
+    CURRENT_OPS_CONTEXT.with(|c| c.set(OpsContext::None));
 }
 
 /// Reset global structop count (call between dispatch rounds).
 pub fn reset_structop_globals() {
     STRUCTOP_GLOBAL_COUNT.store(0, SeqCst);
+}
+
+/// Set the current kfunc name for preemption trace context.
+///
+/// Called at the start of each kfunc in `kfuncs.rs` before `maybe_yield()`.
+/// The name is a short identifier (e.g. `"dsq_insert"`, `"kick_cpu"`).
+pub fn set_current_kfunc(name: &'static str) {
+    CURRENT_KFUNC_NAME.with(|c| c.set(name));
+}
+
+/// Read the current kfunc name.
+pub fn current_kfunc_name() -> &'static str {
+    CURRENT_KFUNC_NAME.with(|c| c.get())
+}
+
+/// Set the cached ops context from SimulatorState.
+///
+/// Called from structop boundary detection and yield paths to keep
+/// the thread-local in sync with `sim.ops_context`.
+pub fn set_current_ops_context(ctx: OpsContext) {
+    CURRENT_OPS_CONTEXT.with(|c| c.set(ctx));
 }
 
 // ---------------------------------------------------------------------------
@@ -951,6 +1018,8 @@ impl PreemptRing {
                 structop_local: sinfo.cpu_count,
                 structop_global: sinfo.global_count,
                 structop_rbc: sinfo.rbc_total,
+                ops_context: sinfo.ops_context,
+                kfunc_name: sinfo.kfunc_name,
             });
         }
         seq
@@ -1174,15 +1243,24 @@ fn cooperative_yield_impl(phase: KfuncYieldPhase) {
     let in_ops = saved_ops_ctx != crate::kfuncs::OpsContext::None;
     maybe_begin_structop(in_ops);
 
+    // Cache ops context for structop_info() to read.
+    set_current_ops_context(saved_ops_ctx);
+
     // Increment per-structop kfunc yield counter.
     inc_structop_kfunc();
 
     let sinfo = structop_info();
+    let ops = sinfo.ops_context.short_name();
+    let kfn = if sinfo.kfunc_name.is_empty() {
+        "-"
+    } else {
+        sinfo.kfunc_name
+    };
 
     // Release token and block until re-selected (futex-based).
     ring.inc_cooperative_yield();
     tracing::debug!(
-        "preempt:{phase} cooperative, structop#{0}:{1} kfunc#{2} (rbc={3})",
+        "preempt:{phase} cooperative, ops={ops} kfunc={kfn} structop#{0}:{1} kfunc#{2} (rbc={3})",
         sinfo.cpu_count,
         sinfo.global_count,
         sinfo.kfunc_count,
@@ -1192,7 +1270,7 @@ fn cooperative_yield_impl(phase: KfuncYieldPhase) {
 
     // Resumed — restore our context to SimulatorState.
     tracing::debug!(
-        "preempt: resumed ({phase}), structop#{0}:{1}",
+        "preempt: resumed ({phase}), ops={ops} kfunc={kfn} structop#{0}:{1}",
         sinfo.cpu_count,
         sinfo.global_count,
     );
@@ -1358,9 +1436,17 @@ extern "C" fn preempt_handler(
 
     // 4. Track structop RBC and emit trace message.
     record_rbc_preemption(rbc_count);
+    // Cache ops context so structop_info() picks it up.
+    set_current_ops_context(saved_ops_ctx);
     let sinfo = structop_info();
+    let ops = sinfo.ops_context.short_name();
+    let kfn = if sinfo.kfunc_name.is_empty() {
+        "-"
+    } else {
+        sinfo.kfunc_name
+    };
     tracing::trace!(
-        "preempt:pmu structop#{0}:{1} rbc={2} rip=0x{3:x}",
+        "preempt:pmu ops={ops} kfunc={kfn} structop#{0}:{1} rbc={2} rip=0x{3:x}",
         sinfo.cpu_count,
         sinfo.global_count,
         sinfo.rbc_total,

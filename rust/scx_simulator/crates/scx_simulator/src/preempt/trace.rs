@@ -8,6 +8,7 @@
 use std::io::{BufRead, Write};
 
 use crate::interleave::WorkerId;
+use crate::kfuncs::OpsContext;
 use crate::perf::PmuEvent;
 use crate::types::CpuId;
 
@@ -127,10 +128,17 @@ impl PreemptionTrace {
             } else {
                 rec.instruction_pointer
             };
+            let kfn = if rec.kfunc_name.is_empty() {
+                "-"
+            } else {
+                rec.kfunc_name
+            };
             writeln!(
                 w,
-                "seq={} structop={}:{} rbc={} timeslice={} rip=0x{:x} rip_offset=0x{:x} cpu={} worker={}",
+                "seq={} ops={} kfunc={} structop={}:{} rbc={} timeslice={} rip=0x{:x} rip_offset=0x{:x} cpu={} worker={}",
                 rec.sequence,
+                rec.ops_context.short_name(),
+                kfn,
                 rec.structop_local,
                 rec.structop_global,
                 rec.structop_rbc,
@@ -213,6 +221,38 @@ fn parse_preemption_line(line: &str, so_base: u64) -> Result<PreemptionRecord, S
     let mut structop_local: u64 = 0;
     let mut structop_global: u64 = 0;
     let mut structop_rbc: u64 = 0;
+    let mut ops_context = OpsContext::None;
+    let mut kfunc_name: &'static str = "";
+
+    /// Leak a short parsed string to get a `&'static str`.
+    ///
+    /// Only used for kfunc names from deserialized trace files; these are
+    /// a small, bounded set so the leak is negligible.
+    fn leak_str(s: &str) -> &'static str {
+        if s == "-" || s.is_empty() {
+            return "";
+        }
+        // Check against known kfunc names to avoid leaking duplicates.
+        match s {
+            "select_cpu_dfl" => "select_cpu_dfl",
+            "select_cpu_and" => "select_cpu_and",
+            "dsq_insert" => "dsq_insert",
+            "dsq_insert_vtime" => "dsq_insert_vtime",
+            "dsq_move_to_local" => "dsq_move_to_local",
+            "dsq_nr_queued" => "dsq_nr_queued",
+            "now" => "now",
+            "get_smp_processor_id" => "get_smp_processor_id",
+            "task_cpu" => "task_cpu",
+            "ktime_get_ns" => "ktime_get_ns",
+            "get_current_task_btf" => "get_current_task_btf",
+            "dsq_iter_begin" => "dsq_iter_begin",
+            "dsq_iter_next" => "dsq_iter_next",
+            "dsq_move" => "dsq_move",
+            "kick_cpu" => "kick_cpu",
+            "task_running" => "task_running",
+            _ => Box::leak(s.to_owned().into_boxed_str()),
+        }
+    }
 
     for part in line.split_whitespace() {
         if let Some(val) = part.strip_prefix("seq=") {
@@ -235,6 +275,10 @@ fn parse_preemption_line(line: &str, so_base: u64) -> Result<PreemptionRecord, S
                 structop_local = l.parse().map_err(|e| format!("structop local: {e}"))?;
                 structop_global = g.parse().map_err(|e| format!("structop global: {e}"))?;
             }
+        } else if let Some(val) = part.strip_prefix("ops=") {
+            ops_context = OpsContext::from_short_name(val);
+        } else if let Some(val) = part.strip_prefix("kfunc=") {
+            kfunc_name = leak_str(val);
         }
     }
 
@@ -265,6 +309,8 @@ fn parse_preemption_line(line: &str, so_base: u64) -> Result<PreemptionRecord, S
         structop_local,
         structop_global,
         structop_rbc,
+        ops_context,
+        kfunc_name,
     })
 }
 
@@ -304,6 +350,8 @@ mod tests {
             structop_local: slocal,
             structop_global: sglobal,
             structop_rbc: srbc,
+            ops_context: OpsContext::None,
+            kfunc_name: "",
         }
     }
 

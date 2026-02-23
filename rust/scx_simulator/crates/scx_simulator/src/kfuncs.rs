@@ -56,12 +56,47 @@ pub mod kfunc_cost {
 /// executed after the callback returns. During `dispatch` inserts are
 /// buffered and flushed after the callback. We track the context so
 /// the engine can resolve `SCX_DSQ_LOCAL` correctly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
 pub enum OpsContext {
-    None,
-    SelectCpu,
-    Enqueue,
-    Dispatch,
+    #[default]
+    None = 0,
+    SelectCpu = 1,
+    Enqueue = 2,
+    Dispatch = 3,
+}
+
+impl OpsContext {
+    /// Short string name for trace output and serialization.
+    pub fn short_name(self) -> &'static str {
+        match self {
+            OpsContext::None => "none",
+            OpsContext::SelectCpu => "select_cpu",
+            OpsContext::Enqueue => "enqueue",
+            OpsContext::Dispatch => "dispatch",
+        }
+    }
+
+    /// Reconstruct from discriminant (for atomic ring deserialization).
+    pub fn from_discriminant(d: u8) -> Self {
+        match d {
+            0 => OpsContext::None,
+            1 => OpsContext::SelectCpu,
+            2 => OpsContext::Enqueue,
+            3 => OpsContext::Dispatch,
+            _ => OpsContext::None,
+        }
+    }
+
+    /// Parse from short name string (for trace deserialization).
+    pub fn from_short_name(s: &str) -> Self {
+        match s {
+            "select_cpu" => OpsContext::SelectCpu,
+            "enqueue" => OpsContext::Enqueue,
+            "dispatch" => OpsContext::Dispatch,
+            _ => OpsContext::None,
+        }
+    }
 }
 
 /// A deferred dispatch request recorded by `scx_bpf_dsq_insert[_vtime]`.
@@ -745,6 +780,7 @@ pub extern "C" fn scx_bpf_select_cpu_dfl(
     _wake_flags: u64,
     is_idle: *mut bool,
 ) -> i32 {
+    crate::preempt::set_current_kfunc("select_cpu_dfl");
     crate::interleave::maybe_yield();
     with_sim(kfunc_cost::COMPLEX, |sim| {
         let cpus_ptr = unsafe { ffi::sim_task_get_cpus_ptr(p) };
@@ -813,6 +849,7 @@ pub extern "C" fn scx_bpf_select_cpu_and(
 ) -> i32 {
     const SCX_PICK_IDLE_CORE: u64 = 1;
 
+    crate::preempt::set_current_kfunc("select_cpu_and");
     crate::interleave::maybe_yield();
     with_sim(kfunc_cost::COMPLEX, |sim| {
         let nr_cpus = sim.cpus.len();
@@ -870,6 +907,7 @@ pub extern "C" fn scx_bpf_select_cpu_and(
 /// at which point `SCX_DSQ_LOCAL` is mapped to the correct CPU.
 #[no_mangle]
 pub extern "C" fn scx_bpf_dsq_insert(p: *mut c_void, dsq_id: u64, slice: u64, enq_flags: u64) {
+    crate::preempt::set_current_kfunc("dsq_insert");
     crate::interleave::maybe_yield();
     with_sim(kfunc_cost::MODERATE, |sim| {
         let pid = sim.task_pid_from_raw(p);
@@ -912,6 +950,7 @@ pub extern "C" fn scx_bpf_dsq_insert_vtime(
     vtime: u64,
     enq_flags: u64,
 ) {
+    crate::preempt::set_current_kfunc("dsq_insert_vtime");
     crate::interleave::maybe_yield();
     let dsq = DsqId(dsq_id);
     assert!(
@@ -949,6 +988,7 @@ pub extern "C" fn scx_bpf_dsq_insert_vtime(
 /// Move the head of a DSQ to the current CPU's local DSQ.
 #[no_mangle]
 pub extern "C" fn scx_bpf_dsq_move_to_local(dsq_id: u64) -> bool {
+    crate::preempt::set_current_kfunc("dsq_move_to_local");
     crate::interleave::maybe_yield();
     with_sim(kfunc_cost::COMPLEX, |sim| {
         let cpu_idx = sim.current_cpu.0 as usize;
@@ -982,6 +1022,7 @@ pub extern "C" fn scx_bpf_dsq_move_to_local(dsq_id: u64) -> bool {
 /// Query the number of tasks queued in a DSQ.
 #[no_mangle]
 pub extern "C" fn scx_bpf_dsq_nr_queued(dsq_id: u64) -> i32 {
+    crate::preempt::set_current_kfunc("dsq_nr_queued");
     crate::interleave::maybe_yield();
     with_sim(kfunc_cost::SIMPLE, |sim| {
         let dsq = DsqId(dsq_id);
@@ -1009,6 +1050,7 @@ pub extern "C" fn scx_bpf_dsq_nr_queued(dsq_id: u64) -> i32 {
 /// Get the current simulated time (per-CPU local clock).
 #[no_mangle]
 pub extern "C" fn scx_bpf_now() -> u64 {
+    crate::preempt::set_current_kfunc("now");
     crate::interleave::maybe_yield();
     with_sim(kfunc_cost::TRIVIAL, |sim| {
         let cpu = sim.current_cpu.0 as usize;
@@ -1019,6 +1061,7 @@ pub extern "C" fn scx_bpf_now() -> u64 {
 /// Get the current CPU ID.
 #[no_mangle]
 pub extern "C" fn bpf_get_smp_processor_id() -> u32 {
+    crate::preempt::set_current_kfunc("get_smp_processor_id");
     crate::interleave::maybe_yield();
     with_sim(kfunc_cost::TRIVIAL, |sim| sim.current_cpu.0)
 }
@@ -1027,6 +1070,7 @@ pub extern "C" fn bpf_get_smp_processor_id() -> u32 {
 /// static function pointer in bpf_helper_defs.h).
 #[no_mangle]
 pub extern "C" fn sim_bpf_get_smp_processor_id() -> u32 {
+    crate::preempt::set_current_kfunc("get_smp_processor_id");
     crate::interleave::maybe_yield();
     with_sim(kfunc_cost::TRIVIAL, |sim| sim.current_cpu.0)
 }
@@ -1078,6 +1122,7 @@ pub extern "C" fn sim_bpf_get_prandom_u32() -> u32 {
 /// run yet.
 #[no_mangle]
 pub extern "C" fn scx_bpf_task_cpu(p: *const c_void) -> i32 {
+    crate::preempt::set_current_kfunc("task_cpu");
     crate::interleave::maybe_yield();
     with_sim(kfunc_cost::SIMPLE, |sim| {
         let pid = sim.task_pid_from_raw(p as *mut c_void);
@@ -1135,6 +1180,7 @@ pub extern "C" fn scx_bpf_destroy_dsq(_dsq_id: u64) {}
 /// No-op for bpf_ktime_get_ns -- use per-CPU local clock.
 #[no_mangle]
 pub extern "C" fn bpf_ktime_get_ns() -> u64 {
+    crate::preempt::set_current_kfunc("ktime_get_ns");
     crate::interleave::maybe_yield();
     with_sim(kfunc_cost::TRIVIAL, |sim| {
         let cpu = sim.current_cpu.0 as usize;
@@ -1169,6 +1215,7 @@ pub extern "C" fn bpf_task_release(_p: *mut c_void) {}
 /// is always "current" on idle CPUs).
 #[no_mangle]
 pub extern "C" fn bpf_get_current_task_btf() -> *mut c_void {
+    crate::preempt::set_current_kfunc("get_current_task_btf");
     crate::interleave::maybe_yield();
     with_sim(kfunc_cost::SIMPLE, |sim| {
         // Waker override: during select_cpu for a waker-induced wake,
@@ -1251,6 +1298,7 @@ pub extern "C" fn scx_bpf_dsq_peek(dsq_id: u64) -> *mut c_void {
 /// state in SimulatorState.
 #[no_mangle]
 pub extern "C" fn sim_dsq_iter_begin(dsq_id: u64, _flags: u64) -> *mut c_void {
+    crate::preempt::set_current_kfunc("dsq_iter_begin");
     crate::interleave::maybe_yield();
     with_sim(kfunc_cost::COMPLEX, |sim| {
         let pids = sim.dsqs.ordered_pids(DsqId(dsq_id));
@@ -1277,6 +1325,7 @@ pub extern "C" fn sim_dsq_iter_begin(dsq_id: u64, _flags: u64) -> *mut c_void {
 /// Advance the DSQ iterator. Returns the next task_struct* or NULL.
 #[no_mangle]
 pub extern "C" fn sim_dsq_iter_next() -> *mut c_void {
+    crate::preempt::set_current_kfunc("dsq_iter_next");
     crate::interleave::maybe_yield();
     with_sim(kfunc_cost::COMPLEX, |sim| {
         let iter = match sim.dsq_iter.as_mut() {
@@ -1310,6 +1359,7 @@ pub extern "C" fn sim_dsq_iter_next() -> *mut c_void {
 /// is determined from the active DSQ iterator state.
 #[no_mangle]
 pub extern "C" fn sim_scx_bpf_dsq_move(p: *mut c_void, dst_dsq_id: u64, _enq_flags: u64) -> bool {
+    crate::preempt::set_current_kfunc("dsq_move");
     crate::interleave::maybe_yield();
     with_sim(kfunc_cost::COMPLEX, |sim| {
         let pid = sim.task_pid_from_raw(p);
@@ -1380,6 +1430,7 @@ pub extern "C" fn bpf_task_from_pid(pid: i32) -> *mut c_void {
 /// on those CPUs. Flags are OR'd so multiple kicks accumulate.
 #[no_mangle]
 pub extern "C" fn scx_bpf_kick_cpu(cpu: i32, flags: u64) {
+    crate::preempt::set_current_kfunc("kick_cpu");
     crate::interleave::maybe_yield();
     with_sim(kfunc_cost::SIMPLE, |sim| {
         let cpu_id = CpuId(cpu as u32);
@@ -1490,6 +1541,7 @@ pub extern "C" fn bpf_map_lookup_percpu_elem(
 /// Check if a task is currently running on any CPU.
 #[no_mangle]
 pub extern "C" fn scx_bpf_task_running(p: *const c_void) -> bool {
+    crate::preempt::set_current_kfunc("task_running");
     crate::interleave::maybe_yield();
     with_sim(kfunc_cost::MODERATE, |sim| {
         let pid = sim.task_pid_from_raw(p as *mut c_void);
