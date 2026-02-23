@@ -476,11 +476,11 @@ fn run_simulation(cli: &Cli, scenario: scx_simulator::Scenario) -> Result<(), St
     // Print simulation summary.
     if cli.verbose_summary {
         let stats = TraceStats::from_trace(&trace);
-        eprintln!();
+        println!();
         stats.print_summary();
     } else {
-        eprintln!();
-        eprintln!("{}", trace.summary());
+        println!();
+        println!("{}", trace.summary());
     }
 
     if trace.has_error() {
@@ -517,6 +517,7 @@ fn list_schedulers() {
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
         .event_format(SimFormat)
         .try_init();
 }

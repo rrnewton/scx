@@ -414,26 +414,26 @@ fn print_simulation_summary(trace: &Trace, tasks: &HashMap<Pid, SimTask>, final_
         }
     }
 
-    eprintln!();
-    eprintln!("Simulation complete:");
-    eprintln!("  Logical time elapsed:   {}", fmt_duration_ns(final_clock));
-    eprintln!("  Total tasks:            {total_tasks}");
-    eprintln!("  Max concurrent running: {max_running}");
-    eprintln!("  Total time slices:      {total_slices}");
-    eprintln!("  Tasks at end:           {tasks_alive} alive, {tasks_runnable} runnable");
+    println!();
+    println!("Simulation complete:");
+    println!("  Logical time elapsed:   {}", fmt_duration_ns(final_clock));
+    println!("  Total tasks:            {total_tasks}");
+    println!("  Max concurrent running: {max_running}");
+    println!("  Total time slices:      {total_slices}");
+    println!("  Tasks at end:           {tasks_alive} alive, {tasks_runnable} runnable");
 
     if let Some(t) = all_completed_at {
         if final_clock > 0 {
-            eprintln!(
+            println!(
                 "  All tasks completed:    {} ({:.1}% of simulation)",
                 fmt_duration_ns(t),
                 t as f64 / final_clock as f64 * 100.0,
             );
         } else {
-            eprintln!("  All tasks completed:    {}", fmt_duration_ns(t));
+            println!("  All tasks completed:    {}", fmt_duration_ns(t));
         }
     } else if completed_count > 0 {
-        eprintln!("  Tasks completed:        {completed_count}/{total_tasks}");
+        println!("  Tasks completed:        {completed_count}/{total_tasks}");
     }
 }
 

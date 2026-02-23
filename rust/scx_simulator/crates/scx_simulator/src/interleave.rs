@@ -146,17 +146,22 @@ impl TokenRing {
     /// Worker: release token, select next worker via PRNG, block until
     /// re-selected.
     ///
+    /// Returns `true` if a different worker was selected (actual context
+    /// switch), `false` if the PRNG re-selected the same worker (no-op yield).
+    ///
     /// The current worker gives up the token and waits for a future
     /// turn. Another worker (possibly the same one) is selected by the
     /// PRNG and woken up.
-    pub fn yield_token(&self, my_id: WorkerId) {
+    pub fn yield_token(&self, my_id: WorkerId) -> bool {
         let mut state = self.mu.lock().unwrap();
         debug_assert_eq!(state.active, Some(my_id));
         state.active = state.pick_next();
+        let switched = state.active != Some(my_id);
         self.cv.notify_all();
         while state.active != Some(my_id) {
             state = self.cv.wait(state).unwrap();
         }
+        switched
     }
 
     /// Worker: mark as finished and wake the next worker (or signal
@@ -258,8 +263,9 @@ pub fn maybe_yield() {
     }
 
     // Release token and block until re-selected.
-    crate::preempt::inc_interleave();
-    ring.yield_token(ctx.worker_id);
+    if ring.yield_token(ctx.worker_id) {
+        crate::preempt::inc_interleave();
+    }
 
     // Resumed — restore our context to SimulatorState.
     // SAFETY: we hold the token again.

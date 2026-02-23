@@ -789,19 +789,19 @@ pub fn print_structop_summary(accum: &[StructopInfo]) {
                      rbc: &dyn std::fmt::Display,
                      kfuncs: &dyn std::fmt::Display,
                      interlv: &dyn std::fmt::Display| {
-        eprint!("  {:>6}  {:>10}", cpu_label, structops);
+        print!("  {:>6}  {:>10}", cpu_label, structops);
         if has_rbc {
-            eprint!("  {:>10}", rbc);
+            print!("  {:>10}", rbc);
         }
-        eprint!("  {:>10}", kfuncs);
+        print!("  {:>10}", kfuncs);
         if has_interlv {
-            eprint!("  {:>10}", interlv);
+            print!("  {:>10}", interlv);
         }
-        eprintln!();
+        println!();
     };
 
-    eprintln!();
-    eprintln!("Sched_ext structop summary:");
+    println!();
+    println!("Sched_ext structop summary:");
     let sep = "----------";
     print_row(&"cpu", &"structops", &"rbc", &"kfuncs", &"interlv");
     print_row(&"------", &sep, &sep, &sep, &sep);
@@ -1145,16 +1145,22 @@ impl PreemptRing {
     ///
     /// **Async-signal-safe**: safe to call from signal handlers.
     ///
+    /// Returns `true` if a different worker was selected (actual context
+    /// switch), `false` if the PRNG re-selected the same worker (no-op yield).
+    ///
     /// Ordering: parks self BEFORE waking next, preventing the race where
     /// the next worker yields back before we enter futex_wait.
-    pub fn yield_token(&self, my_id: WorkerId) {
+    pub fn yield_token(&self, my_id: WorkerId) -> bool {
         // Park ourselves first to prevent wake-before-wait races.
         self.workers[my_id.0].store(PARKED, SeqCst);
 
-        if let Some(next) = self.pick_next() {
+        let switched = if let Some(next) = self.pick_next() {
             self.workers[next.0].store(RUNNING, SeqCst);
             futex_wake(&self.workers[next.0], 1);
-        }
+            next != my_id
+        } else {
+            false
+        };
 
         // Wait until re-selected.
         loop {
@@ -1163,6 +1169,8 @@ impl PreemptRing {
             }
             futex_wait(&self.workers[my_id.0], PARKED);
         }
+
+        switched
     }
 
     /// Worker: mark as finished and wake the next worker (or signal
@@ -1353,7 +1361,6 @@ fn cooperative_yield_impl(phase: KfuncYieldPhase) {
 
     // Release token and block until re-selected (futex-based).
     ring.inc_cooperative_yield();
-    inc_interleave();
     tracing::debug!(
         "preempt:{phase} cooperative, ops={ops} kfunc={kfn} structop#{0}:{1} kfunc#{2} (rbc={3})",
         sinfo.cpu_count,
@@ -1363,7 +1370,9 @@ fn cooperative_yield_impl(phase: KfuncYieldPhase) {
     );
     // Pause measurement counter during yield (don't count parked time).
     disable_measurement(ctx.measure_fd);
-    ring.yield_token(ctx.worker_id);
+    if ring.yield_token(ctx.worker_id) {
+        inc_interleave();
+    }
 
     // Resumed — restore our context to SimulatorState.
     tracing::debug!(
@@ -1644,8 +1653,9 @@ extern "C" fn preempt_handler(
 
     // 6. Yield token (futex-based, signal-safe). Blocks until re-selected.
     ring.inc_signal_preempt(); // atomic, signal-safe
-    inc_interleave(); // TLS, safe (signal masked during handler)
-    ring.yield_token(pctx.worker_id);
+    if ring.yield_token(pctx.worker_id) {
+        inc_interleave(); // TLS, safe (signal masked during handler)
+    }
 
     // 7. Resumed — restore SimulatorState context.
     unsafe {
