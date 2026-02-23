@@ -758,6 +758,74 @@ pub fn structop_info() -> StructopInfo {
     }
 }
 
+/// Print a summary table of per-CPU sched_ext structop statistics.
+///
+/// Prints structops (ops callback invocations), RBC counts, and kfunc
+/// counts per CPU. The RBC column is omitted when no RBC data was
+/// collected (e.g. PMU unavailable in VM).
+pub fn print_structop_summary(accum: &[StructopInfo]) {
+    let total_structops: u64 = accum.iter().map(|a| a.cpu_count).sum();
+    let total_rbc: u64 = accum.iter().map(|a| a.rbc_total).sum();
+    let total_kfunc: u64 = accum.iter().map(|a| a.kfunc_count).sum();
+
+    if total_structops == 0 && total_kfunc == 0 {
+        return;
+    }
+
+    let has_rbc = total_rbc > 0;
+
+    eprintln!("Sched_ext structop summary:");
+    if has_rbc {
+        eprintln!(
+            "  {:>6}  {:>10}  {:>10}  {:>10}",
+            "cpu", "structops", "rbc", "kfuncs"
+        );
+        eprintln!(
+            "  {:>6}  {:>10}  {:>10}  {:>10}",
+            "------", "----------", "----------", "----------"
+        );
+    } else {
+        eprintln!("  {:>6}  {:>10}  {:>10}", "cpu", "structops", "kfuncs");
+        eprintln!(
+            "  {:>6}  {:>10}  {:>10}",
+            "------", "----------", "----------"
+        );
+    }
+
+    for (i, a) in accum.iter().enumerate() {
+        if a.cpu_count > 0 || a.rbc_total > 0 || a.kfunc_count > 0 {
+            if has_rbc {
+                eprintln!(
+                    "  {:>6}  {:>10}  {:>10}  {:>10}",
+                    i, a.cpu_count, a.rbc_total, a.kfunc_count
+                );
+            } else {
+                eprintln!("  {:>6}  {:>10}  {:>10}", i, a.cpu_count, a.kfunc_count);
+            }
+        }
+    }
+
+    if has_rbc {
+        eprintln!(
+            "  {:>6}  {:>10}  {:>10}  {:>10}",
+            "------", "----------", "----------", "----------"
+        );
+        eprintln!(
+            "  {:>6}  {:>10}  {:>10}  {:>10}",
+            "total", total_structops, total_rbc, total_kfunc
+        );
+    } else {
+        eprintln!(
+            "  {:>6}  {:>10}  {:>10}",
+            "------", "----------", "----------"
+        );
+        eprintln!(
+            "  {:>6}  {:>10}  {:>10}",
+            "total", total_structops, total_kfunc
+        );
+    }
+}
+
 /// Record RBC consumed by a preemption on this worker.
 ///
 /// Called from the signal handler. Accumulates into the monotonic

@@ -207,6 +207,30 @@ impl Visit for FieldCollector {
     }
 }
 
+/// Format a nanosecond duration as a human-readable string.
+///
+/// Uses the largest unit that fits without a fractional part, with one
+/// decimal place for sub-unit remainders:
+/// - `0` → `"0ns"`
+/// - `1_500` → `"1.5µs"`
+/// - `20_000_000` → `"20ms"`
+/// - `3_500_000_000` → `"3.5s"`
+pub fn fmt_duration_ns(ns: u64) -> String {
+    const UNITS: &[(u64, &str)] = &[(1_000_000_000, "s"), (1_000_000, "ms"), (1_000, "µs")];
+    for &(divisor, suffix) in UNITS {
+        if ns >= divisor {
+            let whole = ns / divisor;
+            let frac = (ns % divisor) * 10 / divisor;
+            return if frac == 0 {
+                format!("{whole}{suffix}")
+            } else {
+                format!("{whole}.{frac}{suffix}")
+            };
+        }
+    }
+    format!("{ns}ns")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,5 +304,20 @@ mod tests {
             FmtTs::global(999_999_000_000).to_string(),
             "999_999_000_000:G"
         );
+    }
+
+    #[test]
+    fn test_fmt_duration_ns() {
+        assert_eq!(fmt_duration_ns(0), "0ns");
+        assert_eq!(fmt_duration_ns(500), "500ns");
+        assert_eq!(fmt_duration_ns(1_000), "1µs");
+        assert_eq!(fmt_duration_ns(1_500), "1.5µs");
+        assert_eq!(fmt_duration_ns(20_000), "20µs");
+        assert_eq!(fmt_duration_ns(1_000_000), "1ms");
+        assert_eq!(fmt_duration_ns(20_000_000), "20ms");
+        assert_eq!(fmt_duration_ns(50_500_000), "50.5ms");
+        assert_eq!(fmt_duration_ns(1_000_000_000), "1s");
+        assert_eq!(fmt_duration_ns(3_500_000_000), "3.5s");
+        assert_eq!(fmt_duration_ns(100_000_000_000), "100s");
     }
 }

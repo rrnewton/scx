@@ -362,6 +362,81 @@ impl Monitor for NoopMonitor {
     fn sample(&mut self, _ctx: &ProbeContext) {}
 }
 
+/// Print simulation completion summary to stderr.
+///
+/// Shows logical time elapsed, task counts, concurrency, and time-slice
+/// totals. For finite workloads, also prints when all tasks completed.
+fn print_simulation_summary(trace: &Trace, tasks: &HashMap<Pid, SimTask>, final_clock: TimeNs) {
+    use crate::fmt::fmt_duration_ns;
+
+    let total_tasks = tasks.len();
+
+    // End-of-simulation task state counts.
+    let tasks_alive = tasks
+        .values()
+        .filter(|t| !matches!(t.state, TaskState::Exited))
+        .count();
+    let tasks_runnable = tasks
+        .values()
+        .filter(|t| matches!(t.state, TaskState::Runnable | TaskState::Running { .. }))
+        .count();
+
+    // Compute stats from trace events in one pass.
+    let mut running = 0u32;
+    let mut max_running = 0u32;
+    let mut total_slices = 0u64;
+    let mut completed_count = 0u64;
+    let mut all_completed_at: Option<TimeNs> = None;
+
+    for event in trace.events() {
+        match &event.kind {
+            TraceKind::TaskScheduled { .. } => {
+                running += 1;
+                max_running = max_running.max(running);
+                total_slices += 1;
+            }
+            TraceKind::TaskPreempted { .. }
+            | TraceKind::TaskSlept { .. }
+            | TraceKind::TaskYielded { .. } => {
+                running = running.saturating_sub(1);
+            }
+            TraceKind::TaskCompleted { .. } => {
+                running = running.saturating_sub(1);
+                completed_count += 1;
+                if completed_count == total_tasks as u64 {
+                    all_completed_at = Some(event.time_ns);
+                }
+            }
+            TraceKind::SimulationEnd { .. } => {
+                running = running.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+
+    eprintln!();
+    eprintln!("Simulation complete:");
+    eprintln!("  Logical time elapsed:   {}", fmt_duration_ns(final_clock));
+    eprintln!("  Total tasks:            {total_tasks}");
+    eprintln!("  Max concurrent running: {max_running}");
+    eprintln!("  Total time slices:      {total_slices}");
+    eprintln!("  Tasks at end:           {tasks_alive} alive, {tasks_runnable} runnable");
+
+    if let Some(t) = all_completed_at {
+        if final_clock > 0 {
+            eprintln!(
+                "  All tasks completed:    {} ({:.1}% of simulation)",
+                fmt_duration_ns(t),
+                t as f64 / final_clock as f64 * 100.0,
+            );
+        } else {
+            eprintln!("  All tasks completed:    {}", fmt_duration_ns(t));
+        }
+    } else if completed_count > 0 {
+        eprintln!("  Tasks completed:        {completed_count}/{total_tasks}");
+    }
+}
+
 /// Reset kfunc accumulators and enable the RBC counter before an ops call.
 ///
 /// Set `ops_context` on both shared `SimulatorState` and the per-thread
@@ -407,6 +482,15 @@ fn update_sum_exec(raw: *mut c_void, base: TimeNs, elapsed: TimeNs) {
 /// accumulated kfunc cost from `with_sim()` calls serves as a fallback timing
 /// model so that `local_clock` still advances on every callback.
 fn charge_sched_time(state: &mut SimulatorState, cpu: CpuId, ops: &str) {
+    let idx = cpu.0 as usize;
+
+    // Accumulate per-CPU structop stats for the summary table.
+    // Always counted here for consistency across all modes.
+    if idx < state.structop_accum.len() {
+        state.structop_accum[idx].cpu_count += 1;
+        state.structop_accum[idx].kfunc_count += state.rbc_kfunc_calls as u64;
+    }
+
     if let Some(ref rbc) = state.rbc_counter {
         let _ = rbc.disable();
         let count = rbc.read().unwrap_or(0);
@@ -423,6 +507,10 @@ fn charge_sched_time(state: &mut SimulatorState, cpu: CpuId, ops: &str) {
                 total_ns,
                 "sched overhead"
             );
+            // Accumulate RBC into structop summary.
+            if idx < state.structop_accum.len() {
+                state.structop_accum[idx].rbc_total += count;
+            }
         }
     } else if state.overhead.enabled {
         // Fallback: no RBC counter — use accumulated kfunc cost directly.
@@ -1223,6 +1311,12 @@ impl<S: Scheduler> Simulator<S> {
 
         // Set the exit kind on the trace
         state.trace.set_exit_kind(exit_kind);
+
+        // Print end-of-simulation summary.
+        print_simulation_summary(&state.trace, &tasks, state.clock);
+
+        // Print structop summary (per-CPU ops callbacks, RBC, kfuncs).
+        crate::preempt::print_structop_summary(&state.structop_accum);
 
         SimulationResult {
             trace: state.trace,
@@ -3031,11 +3125,6 @@ impl<S: Scheduler> Simulator<S> {
                     }
                     preempt::install(ring_ref, worker_id, timer_fd, timeslice_min, timeslice_max);
 
-                    // Seed per-CPU structop accumulators from previous rounds.
-                    // Each worker touches only its own CPU index — no races.
-                    let structop_base = unsafe { (&(*sp).structop_accum)[cpu.0 as usize] };
-                    preempt::seed_structop(&structop_base);
-
                     ring_ref.wait_for_token(worker_id);
 
                     // Enter sim AFTER acquiring the token to avoid racing on
@@ -3062,6 +3151,34 @@ impl<S: Scheduler> Simulator<S> {
                         let _ = t.disable();
                     }
 
+                    // Read the final PMU counter to capture RBC from the last
+                    // timeslice (between last preemption and dispatch return).
+                    // record_rbc_preemption() accumulated RBC at each preemption
+                    // point, but misses the tail segment.
+                    if timer_fd >= 0 {
+                        let tail_rbc = unsafe {
+                            let mut count: u64 = 0;
+                            libc::read(
+                                timer_fd,
+                                &mut count as *mut u64 as *mut libc::c_void,
+                                std::mem::size_of::<u64>(),
+                            );
+                            count
+                        };
+                        preempt::record_rbc_preemption(tail_rbc);
+                    }
+
+                    // Accumulate per-worker RBC into structop summary.
+                    // This must happen on the worker thread where the
+                    // thread-local STRUCTOP_RBC_TOTAL lives.
+                    unsafe {
+                        let idx = cpu.0 as usize;
+                        if idx < (*sp).structop_accum.len() {
+                            (&mut (*sp).structop_accum)[idx].rbc_total +=
+                                preempt::structop_info().rbc_total;
+                        }
+                    }
+
                     // Clear ops_context AFTER disabling the timer (so
                     // pending PMU signals still see the true callback
                     // context) and BEFORE releasing the token (so the new
@@ -3071,11 +3188,6 @@ impl<S: Scheduler> Simulator<S> {
                     crate::preempt::set_current_ops_context(OpsContext::None);
                     ring_ref.finish(worker_id);
                     kfuncs::exit_sim_no_clear_ops();
-
-                    // Drain per-CPU structop state back to accumulators.
-                    unsafe {
-                        (&mut (*sp).structop_accum)[cpu.0 as usize] = preempt::structop_info();
-                    }
 
                     preempt::uninstall();
                     // timer dropped here — closes the perf fd
@@ -3332,10 +3444,6 @@ impl<S: Scheduler> Simulator<S> {
 
                     preempt::install(ring_ref, worker_id, timer_fd, timeslice_min, timeslice_max);
 
-                    // Seed per-CPU structop accumulators from previous rounds.
-                    let structop_base = unsafe { (&(*sp).structop_accum)[cpu.0 as usize] };
-                    preempt::seed_structop(&structop_base);
-
                     ring_ref.wait_for_token(worker_id);
 
                     // Enter sim AFTER acquiring the token to avoid racing on
@@ -3368,17 +3476,33 @@ impl<S: Scheduler> Simulator<S> {
                         let _ = t.disable();
                     }
 
+                    // Read tail RBC and accumulate into structop summary.
+                    if timer_fd >= 0 {
+                        let tail_rbc = unsafe {
+                            let mut count: u64 = 0;
+                            libc::read(
+                                timer_fd,
+                                &mut count as *mut u64 as *mut libc::c_void,
+                                std::mem::size_of::<u64>(),
+                            );
+                            count
+                        };
+                        preempt::record_rbc_preemption(tail_rbc);
+                    }
+                    unsafe {
+                        let idx = cpu.0 as usize;
+                        if idx < (*sp).structop_accum.len() {
+                            (&mut (*sp).structop_accum)[idx].rbc_total +=
+                                preempt::structop_info().rbc_total;
+                        }
+                    }
+
                     // Clear ops_context after timer disable, before token
                     // release (same pattern as dispatch_concurrent_preemptive).
                     unsafe { (*sp).ops_context = OpsContext::None };
                     crate::preempt::set_current_ops_context(OpsContext::None);
                     ring_ref.finish(worker_id);
                     kfuncs::exit_sim_no_clear_ops();
-
-                    // Drain per-CPU structop state back to accumulators.
-                    unsafe {
-                        (&mut (*sp).structop_accum)[cpu.0 as usize] = preempt::structop_info();
-                    }
 
                     preempt::uninstall();
                 });
