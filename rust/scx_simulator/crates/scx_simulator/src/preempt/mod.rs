@@ -1434,24 +1434,14 @@ extern "C" fn preempt_handler(
         )
     };
 
-    // 4. Track structop RBC and emit trace message.
+    // 4. Track structop RBC.
+    //    NOTE: Do NOT call tracing::trace!() here — tracing uses internal
+    //    mutexes and is NOT async-signal-safe. Calling it from a signal
+    //    handler deadlocks when the main thread is mid-tracing call.
     record_rbc_preemption(rbc_count);
     // Cache ops context so structop_info() picks it up.
     set_current_ops_context(saved_ops_ctx);
     let sinfo = structop_info();
-    let ops = sinfo.ops_context.short_name();
-    let kfn = if sinfo.kfunc_name.is_empty() {
-        "-"
-    } else {
-        sinfo.kfunc_name
-    };
-    tracing::trace!(
-        "preempt:pmu ops={ops} kfunc={kfn} structop#{0}:{1} rbc={2} rip=0x{3:x}",
-        sinfo.cpu_count,
-        sinfo.global_count,
-        sinfo.rbc_total,
-        instruction_pointer,
-    );
 
     // 4a. Record the preemption point (with structop context).
     ring.record_preemption(
