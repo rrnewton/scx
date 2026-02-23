@@ -455,7 +455,7 @@ fn set_ops_context(state: &mut SimulatorState, ctx: OpsContext) {
 
 /// The kfunc counters are always reset so that `charge_sched_time` can
 /// apply the accumulated kfunc cost even when the RBC counter is
-/// unavailable (interleaving mode, VM/container, etc.).
+/// unavailable (VM/container, etc.).
 fn start_rbc(state: &mut SimulatorState) {
     state.rbc_kfunc_calls = 0;
     state.rbc_kfunc_ns = 0;
@@ -478,7 +478,7 @@ fn update_sum_exec(raw: *mut c_void, base: TimeNs, elapsed: TimeNs) {
 /// Disable the RBC counter, read the count, and charge scheduler overhead to `cpu`.
 ///
 /// When the RBC counter is available, overhead = RBC-derived time + kfunc cost.
-/// When the RBC counter is unavailable (interleaving mode, VM, etc.), the
+/// When the RBC counter is unavailable (VM, concurrent batch, etc.), the
 /// accumulated kfunc cost from `with_sim()` calls serves as a fallback timing
 /// model so that `local_clock` still advances on every callback.
 fn charge_sched_time(state: &mut SimulatorState, cpu: CpuId, ops: &str) {
@@ -806,13 +806,17 @@ impl<S: Scheduler> Simulator<S> {
 
         // Build simulator state (shared with kfuncs via thread-local)
         //
-        // NOTE: RBC counter is disabled when interleaving is enabled because:
-        // 1. The PMU counter is thread-local (created with pid=0 for current thread)
-        // 2. In interleave mode, scheduler callbacks run on worker threads
-        // 3. The counter would only count main thread branches, not worker thread branches
-        // 4. Main thread branches during thread::scope are non-deterministic (OS scheduling)
+        // The RBC counter is created with pid=0 (current thread) and measures
+        // retired conditional branches on the main engine thread. In interleave/
+        // preemptive mode, concurrent batches run scheduler callbacks on worker
+        // threads where this counter is invisible — those paths use per-thread
+        // `measure_counter` instances instead. Sequential callbacks (global
+        // events, single-CPU batches) still run on the main thread and benefit
+        // from this counter. `process_batch_concurrent` temporarily takes the
+        // counter out of state during concurrent processing to prevent worker
+        // threads from accessing a main-thread-only PMU fd.
         let rbc_ns = scenario.sched_overhead_rbc_ns.filter(|&ns| ns > 0);
-        let rbc_counter = if rbc_ns.is_some() && !scenario.interleave {
+        let rbc_counter = if rbc_ns.is_some() {
             perf::try_create_rbc_counter()
         } else {
             None
@@ -3041,6 +3045,15 @@ impl<S: Scheduler> Simulator<S> {
                         dispatch_worker_body(sp, schp, cpu);
                     }
 
+                    // Drain per-worker interleave count into structop accumulator.
+                    unsafe {
+                        let idx = cpu.0 as usize;
+                        if idx < (*sp).structop_accum.len() {
+                            (&mut (*sp).structop_accum)[idx].interleave_count +=
+                                crate::preempt::structop_info().interleave_count;
+                        }
+                    }
+
                     // Clear ops_context before releasing the token to avoid
                     // a race: after finish(), the new token holder writes
                     // ops_context = Dispatch and our exit_sim must not
@@ -3108,6 +3121,12 @@ impl<S: Scheduler> Simulator<S> {
                     // Skip if cooperative_only mode is requested.
                     let (timer, timer_fd) = setup_pmu_timer(cooperative_only, break_on);
 
+                    // Create per-thread RBC measurement counter (separate from
+                    // the preemption timer). This counts cumulative C-code RBC
+                    // with pauses during kfuncs, matching non-preemptive mode.
+                    let measure_counter = perf::try_create_rbc_counter();
+                    let measure_fd = measure_counter.as_ref().map_or(-1, |c| c.raw_fd());
+
                     if cooperative_only {
                         debug!(
                             worker = i,
@@ -3123,7 +3142,14 @@ impl<S: Scheduler> Simulator<S> {
                             "preempt: PMU unavailable, cooperative-only"
                         );
                     }
-                    preempt::install(ring_ref, worker_id, timer_fd, timeslice_min, timeslice_max);
+                    preempt::install(
+                        ring_ref,
+                        worker_id,
+                        timer_fd,
+                        measure_fd,
+                        timeslice_min,
+                        timeslice_max,
+                    );
 
                     ring_ref.wait_for_token(worker_id);
 
@@ -3141,6 +3167,12 @@ impl<S: Scheduler> Simulator<S> {
                         }
                     }
 
+                    // Enable measurement counter before entering C code.
+                    if let Some(ref mc) = measure_counter {
+                        let _ = mc.reset();
+                        let _ = mc.enable();
+                    }
+
                     unsafe {
                         debug!(cpu = cpu.0, "enter:structop dispatch (preemptive)");
                         dispatch_worker_body(sp, schp, cpu);
@@ -3151,31 +3183,26 @@ impl<S: Scheduler> Simulator<S> {
                         let _ = t.disable();
                     }
 
-                    // Read the final PMU counter to capture RBC from the last
-                    // timeslice (between last preemption and dispatch return).
-                    // record_rbc_preemption() accumulated RBC at each preemption
-                    // point, but misses the tail segment.
-                    if timer_fd >= 0 {
-                        let tail_rbc = unsafe {
-                            let mut count: u64 = 0;
-                            libc::read(
-                                timer_fd,
-                                &mut count as *mut u64 as *mut libc::c_void,
-                                std::mem::size_of::<u64>(),
-                            );
-                            count
-                        };
-                        preempt::record_rbc_preemption(tail_rbc);
+                    // Disable and read the measurement counter. This gives
+                    // cumulative C-code-only RBC (kfuncs were excluded by
+                    // pause_measurement/resume_measurement in with_sim).
+                    if let Some(ref mc) = measure_counter {
+                        let _ = mc.disable();
+                        let rbc = mc.read().unwrap_or(0);
+                        unsafe {
+                            let idx = cpu.0 as usize;
+                            if idx < (*sp).structop_accum.len() {
+                                (&mut (*sp).structop_accum)[idx].rbc_total += rbc;
+                            }
+                        }
                     }
 
-                    // Accumulate per-worker RBC into structop summary.
-                    // This must happen on the worker thread where the
-                    // thread-local STRUCTOP_RBC_TOTAL lives.
+                    // Drain per-worker interleave count into structop accumulator.
                     unsafe {
                         let idx = cpu.0 as usize;
                         if idx < (*sp).structop_accum.len() {
-                            (&mut (*sp).structop_accum)[idx].rbc_total +=
-                                preempt::structop_info().rbc_total;
+                            (&mut (*sp).structop_accum)[idx].interleave_count +=
+                                preempt::structop_info().interleave_count;
                         }
                     }
 
@@ -3190,7 +3217,7 @@ impl<S: Scheduler> Simulator<S> {
                     kfuncs::exit_sim_no_clear_ops();
 
                     preempt::uninstall();
-                    // timer dropped here — closes the perf fd
+                    // timer + measure_counter dropped here — closes the perf fds
                 });
             }
 
@@ -3261,6 +3288,12 @@ impl<S: Scheduler> Simulator<S> {
         state.in_concurrent_batch = true;
         state.kicked_cpus.clear();
 
+        // Temporarily remove the main-thread RBC counter so worker threads
+        // (which access state via raw pointers) don't touch a PMU fd bound
+        // to the main thread. Workers have their own per-thread measurement
+        // counters. Restored after the concurrent block returns.
+        let main_rbc_counter = state.rbc_counter.take();
+
         // Advance each CPU's clock before spawning.
         for &cpu in &cpu_ids {
             state.advance_cpu_clock(cpu);
@@ -3311,6 +3344,7 @@ impl<S: Scheduler> Simulator<S> {
             );
         }
 
+        state.rbc_counter = main_rbc_counter;
         state.in_concurrent_batch = false;
 
         // Process deferred kicked CPUs from the concurrent batch.
@@ -3374,6 +3408,15 @@ impl<S: Scheduler> Simulator<S> {
                             duration_ns,
                             max_cgroups,
                         );
+                    }
+
+                    // Drain per-worker interleave count into structop accumulator.
+                    unsafe {
+                        let idx = cpu.0 as usize;
+                        if idx < (*sp).structop_accum.len() {
+                            (&mut (*sp).structop_accum)[idx].interleave_count +=
+                                crate::preempt::structop_info().interleave_count;
+                        }
                     }
 
                     // Clear ops_context before releasing the token (same
@@ -3442,13 +3485,30 @@ impl<S: Scheduler> Simulator<S> {
                     // Skip if cooperative_only mode is requested.
                     let (timer, timer_fd) = setup_pmu_timer(cooperative_only, break_on);
 
-                    preempt::install(ring_ref, worker_id, timer_fd, timeslice_min, timeslice_max);
+                    // Create per-thread RBC measurement counter.
+                    let measure_counter = perf::try_create_rbc_counter();
+                    let measure_fd = measure_counter.as_ref().map_or(-1, |c| c.raw_fd());
+
+                    preempt::install(
+                        ring_ref,
+                        worker_id,
+                        timer_fd,
+                        measure_fd,
+                        timeslice_min,
+                        timeslice_max,
+                    );
 
                     ring_ref.wait_for_token(worker_id);
 
                     // Enter sim AFTER acquiring the token to avoid racing on
                     // SimulatorState.current_cpu with other workers.
                     unsafe { kfuncs::enter_sim(&mut *sp, cpu) };
+
+                    // Enable measurement counter before entering scheduler code.
+                    if let Some(ref mc) = measure_counter {
+                        let _ = mc.reset();
+                        let _ = mc.enable();
+                    }
 
                     // Don't arm the PMU timer upfront. Unlike
                     // dispatch_concurrent_preemptive (which runs a tight
@@ -3476,24 +3536,24 @@ impl<S: Scheduler> Simulator<S> {
                         let _ = t.disable();
                     }
 
-                    // Read tail RBC and accumulate into structop summary.
-                    if timer_fd >= 0 {
-                        let tail_rbc = unsafe {
-                            let mut count: u64 = 0;
-                            libc::read(
-                                timer_fd,
-                                &mut count as *mut u64 as *mut libc::c_void,
-                                std::mem::size_of::<u64>(),
-                            );
-                            count
-                        };
-                        preempt::record_rbc_preemption(tail_rbc);
+                    // Read cumulative C-code RBC from measurement counter.
+                    if let Some(ref mc) = measure_counter {
+                        let _ = mc.disable();
+                        let rbc = mc.read().unwrap_or(0);
+                        unsafe {
+                            let idx = cpu.0 as usize;
+                            if idx < (*sp).structop_accum.len() {
+                                (&mut (*sp).structop_accum)[idx].rbc_total += rbc;
+                            }
+                        }
                     }
+
+                    // Drain per-worker interleave count into structop accumulator.
                     unsafe {
                         let idx = cpu.0 as usize;
                         if idx < (*sp).structop_accum.len() {
-                            (&mut (*sp).structop_accum)[idx].rbc_total +=
-                                preempt::structop_info().rbc_total;
+                            (&mut (*sp).structop_accum)[idx].interleave_count +=
+                                preempt::structop_info().interleave_count;
                         }
                     }
 

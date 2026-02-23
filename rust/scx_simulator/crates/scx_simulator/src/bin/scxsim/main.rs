@@ -476,9 +476,11 @@ fn run_simulation(cli: &Cli, scenario: scx_simulator::Scenario) -> Result<(), St
     // Print simulation summary.
     if cli.verbose_summary {
         let stats = TraceStats::from_trace(&trace);
+        eprintln!();
         stats.print_summary();
     } else {
-        println!("{}", trace.summary());
+        eprintln!();
+        eprintln!("{}", trace.summary());
     }
 
     if trace.has_error() {

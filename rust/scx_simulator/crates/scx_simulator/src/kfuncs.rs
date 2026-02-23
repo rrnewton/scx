@@ -805,6 +805,8 @@ where
             if let Some(ref rbc) = sim.rbc_counter {
                 let _ = rbc.disable();
             }
+            // Pause RBC measurement counter (preemptive mode)
+            crate::preempt::pause_measurement();
             // Pause preemption timer — prevent signals while &mut SimulatorState exists
             crate::preempt::pause_timer();
 
@@ -814,6 +816,8 @@ where
             if let Some(ref rbc) = sim.rbc_counter {
                 let _ = rbc.enable();
             }
+            // Resume RBC measurement counter (preemptive mode)
+            crate::preempt::resume_measurement();
             result
         };
         // &mut SimulatorState borrow ended — safe to yield.

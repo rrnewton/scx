@@ -262,6 +262,11 @@ impl RbcCounter {
     pub fn read(&self) -> Result<u64, PerfError> {
         read_counter(self.fd)
     }
+
+    /// Return the raw file descriptor for this counter.
+    pub fn raw_fd(&self) -> RawFd {
+        self.fd
+    }
 }
 
 impl Drop for RbcCounter {

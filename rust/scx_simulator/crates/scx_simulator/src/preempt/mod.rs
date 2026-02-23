@@ -699,6 +699,7 @@ fn futex_wake(futex: &AtomicU32, count: i32) {
 /// - `global_count`: how many structops all CPUs have entered
 /// - `rbc_total`: cumulative retired conditional branches on this CPU
 /// - `kfunc_count`: cumulative cooperative yields on this CPU
+/// - `interleave_count`: cumulative interleaving events (preemptions + yields)
 /// - `ops_context`: which ops callback is currently active
 /// - `kfunc_name`: name of the kfunc about to be called
 #[derive(Debug, Clone, Copy, Default)]
@@ -711,6 +712,8 @@ pub struct StructopInfo {
     pub rbc_total: u64,
     /// Cumulative cooperative yield count on this CPU (monotonically increasing).
     pub kfunc_count: u64,
+    /// Cumulative interleaving events on this CPU (preemptions + cooperative yields).
+    pub interleave_count: u64,
     /// Which ops callback is currently active.
     pub ops_context: OpsContext,
     /// Name of the kfunc about to be called (empty string if unknown).
@@ -721,6 +724,7 @@ thread_local! {
     static STRUCTOP_CPU_COUNT: Cell<u64> = const { Cell::new(0) };
     static STRUCTOP_RBC_TOTAL: Cell<u64> = const { Cell::new(0) };
     static STRUCTOP_KFUNC_COUNT: Cell<u64> = const { Cell::new(0) };
+    static STRUCTOP_INTERLEAVE_COUNT: Cell<u64> = const { Cell::new(0) };
     static IN_STRUCTOP: Cell<bool> = const { Cell::new(false) };
     /// Current kfunc name, set before each `maybe_yield()` call.
     static CURRENT_KFUNC_NAME: Cell<&'static str> = const { Cell::new("") };
@@ -735,6 +739,7 @@ pub fn seed_structop(base: &StructopInfo) {
     STRUCTOP_CPU_COUNT.with(|c| c.set(base.cpu_count));
     STRUCTOP_RBC_TOTAL.with(|c| c.set(base.rbc_total));
     STRUCTOP_KFUNC_COUNT.with(|c| c.set(base.kfunc_count));
+    STRUCTOP_INTERLEAVE_COUNT.with(|c| c.set(base.interleave_count));
     IN_STRUCTOP.with(|c| c.set(false));
     CURRENT_KFUNC_NAME.with(|c| c.set(""));
     CURRENT_OPS_CONTEXT.with(|c| c.set(OpsContext::None));
@@ -753,6 +758,7 @@ pub fn structop_info() -> StructopInfo {
         global_count: STRUCTOP_GLOBAL_COUNT.load(SeqCst),
         rbc_total: STRUCTOP_RBC_TOTAL.with(|c| c.get()),
         kfunc_count: STRUCTOP_KFUNC_COUNT.with(|c| c.get()),
+        interleave_count: STRUCTOP_INTERLEAVE_COUNT.with(|c| c.get()),
         ops_context: CURRENT_OPS_CONTEXT.with(|c| c.get()),
         kfunc_name: CURRENT_KFUNC_NAME.with(|c| c.get()),
     }
@@ -760,70 +766,66 @@ pub fn structop_info() -> StructopInfo {
 
 /// Print a summary table of per-CPU sched_ext structop statistics.
 ///
-/// Prints structops (ops callback invocations), RBC counts, and kfunc
-/// counts per CPU. The RBC column is omitted when no RBC data was
-/// collected (e.g. PMU unavailable in VM).
+/// Prints structops (ops callback invocations), RBC counts, kfunc
+/// counts, and interleaving counts per CPU. The RBC and interlv columns
+/// are omitted when their totals are zero.
 pub fn print_structop_summary(accum: &[StructopInfo]) {
     let total_structops: u64 = accum.iter().map(|a| a.cpu_count).sum();
     let total_rbc: u64 = accum.iter().map(|a| a.rbc_total).sum();
     let total_kfunc: u64 = accum.iter().map(|a| a.kfunc_count).sum();
+    let total_interleave: u64 = accum.iter().map(|a| a.interleave_count).sum();
 
     if total_structops == 0 && total_kfunc == 0 {
         return;
     }
 
     let has_rbc = total_rbc > 0;
+    let has_interlv = total_interleave > 0;
 
+    // Build column definitions: (header, separator, per-row value extractor, total).
+    // Always-present columns first, then conditionals.
+    let print_row = |cpu_label: &dyn std::fmt::Display,
+                     structops: &dyn std::fmt::Display,
+                     rbc: &dyn std::fmt::Display,
+                     kfuncs: &dyn std::fmt::Display,
+                     interlv: &dyn std::fmt::Display| {
+        eprint!("  {:>6}  {:>10}", cpu_label, structops);
+        if has_rbc {
+            eprint!("  {:>10}", rbc);
+        }
+        eprint!("  {:>10}", kfuncs);
+        if has_interlv {
+            eprint!("  {:>10}", interlv);
+        }
+        eprintln!();
+    };
+
+    eprintln!();
     eprintln!("Sched_ext structop summary:");
-    if has_rbc {
-        eprintln!(
-            "  {:>6}  {:>10}  {:>10}  {:>10}",
-            "cpu", "structops", "rbc", "kfuncs"
-        );
-        eprintln!(
-            "  {:>6}  {:>10}  {:>10}  {:>10}",
-            "------", "----------", "----------", "----------"
-        );
-    } else {
-        eprintln!("  {:>6}  {:>10}  {:>10}", "cpu", "structops", "kfuncs");
-        eprintln!(
-            "  {:>6}  {:>10}  {:>10}",
-            "------", "----------", "----------"
-        );
-    }
+    let sep = "----------";
+    print_row(&"cpu", &"structops", &"rbc", &"kfuncs", &"interlv");
+    print_row(&"------", &sep, &sep, &sep, &sep);
 
     for (i, a) in accum.iter().enumerate() {
-        if a.cpu_count > 0 || a.rbc_total > 0 || a.kfunc_count > 0 {
-            if has_rbc {
-                eprintln!(
-                    "  {:>6}  {:>10}  {:>10}  {:>10}",
-                    i, a.cpu_count, a.rbc_total, a.kfunc_count
-                );
-            } else {
-                eprintln!("  {:>6}  {:>10}  {:>10}", i, a.cpu_count, a.kfunc_count);
-            }
+        if a.cpu_count > 0 || a.rbc_total > 0 || a.kfunc_count > 0 || a.interleave_count > 0 {
+            print_row(
+                &i,
+                &a.cpu_count,
+                &a.rbc_total,
+                &a.kfunc_count,
+                &a.interleave_count,
+            );
         }
     }
 
-    if has_rbc {
-        eprintln!(
-            "  {:>6}  {:>10}  {:>10}  {:>10}",
-            "------", "----------", "----------", "----------"
-        );
-        eprintln!(
-            "  {:>6}  {:>10}  {:>10}  {:>10}",
-            "total", total_structops, total_rbc, total_kfunc
-        );
-    } else {
-        eprintln!(
-            "  {:>6}  {:>10}  {:>10}",
-            "------", "----------", "----------"
-        );
-        eprintln!(
-            "  {:>6}  {:>10}  {:>10}",
-            "total", total_structops, total_kfunc
-        );
-    }
+    print_row(&"------", &sep, &sep, &sep, &sep);
+    print_row(
+        &"total",
+        &total_structops,
+        &total_rbc,
+        &total_kfunc,
+        &total_interleave,
+    );
 }
 
 /// Record RBC consumed by a preemption on this worker.
@@ -839,6 +841,14 @@ pub fn record_rbc_preemption(timeslice: u64) {
 /// Called from `maybe_yield_preemptive()` on each cooperative yield.
 pub fn inc_structop_kfunc() {
     STRUCTOP_KFUNC_COUNT.with(|c| c.set(c.get() + 1));
+}
+
+/// Increment the per-CPU interleave counter (monotonic).
+///
+/// Called from every yield site: signal preemptions, cooperative yields
+/// (preemptive ring), and cooperative yields (token ring).
+pub fn inc_interleave() {
+    STRUCTOP_INTERLEAVE_COUNT.with(|c| c.set(c.get() + 1));
 }
 
 /// Detect structop boundary transitions and call `begin_structop()` when
@@ -859,6 +869,7 @@ pub fn reset_structop_cpu_count() {
     STRUCTOP_CPU_COUNT.with(|c| c.set(0));
     STRUCTOP_RBC_TOTAL.with(|c| c.set(0));
     STRUCTOP_KFUNC_COUNT.with(|c| c.set(0));
+    STRUCTOP_INTERLEAVE_COUNT.with(|c| c.set(0));
     IN_STRUCTOP.with(|c| c.set(false));
     CURRENT_KFUNC_NAME.with(|c| c.set(""));
     CURRENT_OPS_CONTEXT.with(|c| c.set(OpsContext::None));
@@ -1189,6 +1200,9 @@ struct PreemptCtx {
     worker_id: WorkerId,
     /// Raw fd of the RBC timer (for disable/enable in signal handler).
     timer_fd: RawFd,
+    /// Raw fd of the RBC measurement counter (for cumulative C-code RBC).
+    /// -1 if unavailable (no PMU support).
+    measure_fd: RawFd,
     /// Timeslice range for re-arming the timer after preemption.
     timeslice_min: u64,
     timeslice_max: u64,
@@ -1206,6 +1220,7 @@ pub fn install(
     ring: &PreemptRing,
     worker_id: WorkerId,
     timer_fd: RawFd,
+    measure_fd: RawFd,
     timeslice_min: u64,
     timeslice_max: u64,
 ) {
@@ -1214,6 +1229,7 @@ pub fn install(
             ring: ring as *const PreemptRing,
             worker_id,
             timer_fd,
+            measure_fd,
             timeslice_min,
             timeslice_max,
         }));
@@ -1337,6 +1353,7 @@ fn cooperative_yield_impl(phase: KfuncYieldPhase) {
 
     // Release token and block until re-selected (futex-based).
     ring.inc_cooperative_yield();
+    inc_interleave();
     tracing::debug!(
         "preempt:{phase} cooperative, ops={ops} kfunc={kfn} structop#{0}:{1} kfunc#{2} (rbc={3})",
         sinfo.cpu_count,
@@ -1344,6 +1361,8 @@ fn cooperative_yield_impl(phase: KfuncYieldPhase) {
         sinfo.kfunc_count,
         sinfo.rbc_total,
     );
+    // Pause measurement counter during yield (don't count parked time).
+    disable_measurement(ctx.measure_fd);
     ring.yield_token(ctx.worker_id);
 
     // Resumed — restore our context to SimulatorState.
@@ -1352,6 +1371,8 @@ fn cooperative_yield_impl(phase: KfuncYieldPhase) {
         sinfo.cpu_count,
         sinfo.global_count,
     );
+    // Resume measurement counter now that we're running again.
+    enable_measurement(ctx.measure_fd);
     unsafe {
         (*sim_ptr).current_cpu = saved_cpu;
         (*sim_ptr).ops_context = saved_ops_ctx;
@@ -1391,6 +1412,27 @@ pub fn resume_timer() {
     if let Some(ctx) = PREEMPT_CTX.with(|c| c.get()) {
         let ring = unsafe { &*ctx.ring };
         rearm_timer(ring, &ctx);
+    }
+}
+
+/// Pause the RBC measurement counter during kfunc execution.
+///
+/// Called by `with_sim()` alongside `pause_timer()`. The measurement counter
+/// tracks cumulative scheduler C-code RBC, excluding kfuncs. No-op if
+/// preemptive interleaving is not active or no measurement counter exists.
+pub fn pause_measurement() {
+    if let Some(ctx) = PREEMPT_CTX.with(|c| c.get()) {
+        disable_measurement(ctx.measure_fd);
+    }
+}
+
+/// Resume the RBC measurement counter after kfunc execution.
+///
+/// Called by `with_sim()` alongside `resume_timer()`. No-op if preemptive
+/// interleaving is not active or no measurement counter exists.
+pub fn resume_measurement() {
+    if let Some(ctx) = PREEMPT_CTX.with(|c| c.get()) {
+        enable_measurement(ctx.measure_fd);
     }
 }
 
@@ -1597,18 +1639,25 @@ extern "C" fn preempt_handler(
         sinfo,
     );
 
-    // 5. Yield token (futex-based, signal-safe). Blocks until re-selected.
+    // 5. Pause measurement counter before yielding (don't count parked time).
+    disable_measurement(pctx.measure_fd);
+
+    // 6. Yield token (futex-based, signal-safe). Blocks until re-selected.
     ring.inc_signal_preempt(); // atomic, signal-safe
+    inc_interleave(); // TLS, safe (signal masked during handler)
     ring.yield_token(pctx.worker_id);
 
-    // 6. Resumed — restore SimulatorState context.
+    // 7. Resumed — restore SimulatorState context.
     unsafe {
         (*sim_ptr).current_cpu = saved_cpu;
         (*sim_ptr).ops_context = saved_ops_ctx;
         (*sim_ptr).waker_task_raw = saved_waker;
     }
 
-    // 7. Do NOT re-arm the timer here. With small timeslices (e.g. 1 RBC),
+    // 8. Resume measurement counter now that we're running again.
+    enable_measurement(pctx.measure_fd);
+
+    // 9. Do NOT re-arm the timer here. With small timeslices (e.g. 1 RBC),
     //    re-arming inside the handler causes a livelock: the timer overflows
     //    during the handler's own return code, the pending signal fires
     //    immediately (SIGSTKFLT is blocked during the handler, no SA_NODEFER),
@@ -1630,6 +1679,26 @@ fn disable_timer(fd: RawFd) {
     }
     unsafe {
         libc::ioctl(fd, scx_perf::PERF_IOC_DISABLE, 0 as libc::c_ulong);
+    }
+}
+
+/// Disable the measurement counter. No-op if fd is -1.
+fn disable_measurement(fd: RawFd) {
+    if fd < 0 {
+        return;
+    }
+    unsafe {
+        libc::ioctl(fd, scx_perf::PERF_IOC_DISABLE, 0 as libc::c_ulong);
+    }
+}
+
+/// Enable the measurement counter. No-op if fd is -1.
+fn enable_measurement(fd: RawFd) {
+    if fd < 0 {
+        return;
+    }
+    unsafe {
+        libc::ioctl(fd, scx_perf::PERF_IOC_ENABLE, 0 as libc::c_ulong);
     }
 }
 

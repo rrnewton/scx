@@ -258,6 +258,7 @@ pub fn maybe_yield() {
     }
 
     // Release token and block until re-selected.
+    crate::preempt::inc_interleave();
     ring.yield_token(ctx.worker_id);
 
     // Resumed — restore our context to SimulatorState.
