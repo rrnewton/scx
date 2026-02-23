@@ -49,13 +49,14 @@ pub mod kfunc_cost {
     pub const COMPLEX: u64 = 200;
 }
 
-/// Which scheduler callback is currently executing.
+/// Which scheduler ops callback is currently executing.
 ///
 /// The kernel defers `scx_bpf_dsq_insert` — it never inserts immediately.
 /// During `select_cpu`/`enqueue` the intent is recorded on the task and
 /// executed after the callback returns. During `dispatch` inserts are
 /// buffered and flushed after the callback. We track the context so
-/// the engine can resolve `SCX_DSQ_LOCAL` correctly.
+/// the engine can resolve `SCX_DSQ_LOCAL` correctly, and so the PMU
+/// preemption handler records which callback was active at preemption.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum OpsContext {
@@ -64,6 +65,17 @@ pub enum OpsContext {
     SelectCpu = 1,
     Enqueue = 2,
     Dispatch = 3,
+    Tick = 4,
+    Stopping = 5,
+    Running = 6,
+    UpdateIdle = 7,
+    FireTimer = 8,
+    CpuOnline = 9,
+    CpuOffline = 10,
+    Runnable = 11,
+    Quiescent = 12,
+    Dequeue = 13,
+    Enable = 14,
 }
 
 impl OpsContext {
@@ -74,6 +86,17 @@ impl OpsContext {
             OpsContext::SelectCpu => "select_cpu",
             OpsContext::Enqueue => "enqueue",
             OpsContext::Dispatch => "dispatch",
+            OpsContext::Tick => "tick",
+            OpsContext::Stopping => "stopping",
+            OpsContext::Running => "running",
+            OpsContext::UpdateIdle => "update_idle",
+            OpsContext::FireTimer => "fire_timer",
+            OpsContext::CpuOnline => "cpu_online",
+            OpsContext::CpuOffline => "cpu_offline",
+            OpsContext::Runnable => "runnable",
+            OpsContext::Quiescent => "quiescent",
+            OpsContext::Dequeue => "dequeue",
+            OpsContext::Enable => "enable",
         }
     }
 
@@ -84,6 +107,17 @@ impl OpsContext {
             1 => OpsContext::SelectCpu,
             2 => OpsContext::Enqueue,
             3 => OpsContext::Dispatch,
+            4 => OpsContext::Tick,
+            5 => OpsContext::Stopping,
+            6 => OpsContext::Running,
+            7 => OpsContext::UpdateIdle,
+            8 => OpsContext::FireTimer,
+            9 => OpsContext::CpuOnline,
+            10 => OpsContext::CpuOffline,
+            11 => OpsContext::Runnable,
+            12 => OpsContext::Quiescent,
+            13 => OpsContext::Dequeue,
+            14 => OpsContext::Enable,
             _ => OpsContext::None,
         }
     }
@@ -94,6 +128,17 @@ impl OpsContext {
             "select_cpu" => OpsContext::SelectCpu,
             "enqueue" => OpsContext::Enqueue,
             "dispatch" => OpsContext::Dispatch,
+            "tick" => OpsContext::Tick,
+            "stopping" => OpsContext::Stopping,
+            "running" => OpsContext::Running,
+            "update_idle" => OpsContext::UpdateIdle,
+            "fire_timer" => OpsContext::FireTimer,
+            "cpu_online" => OpsContext::CpuOnline,
+            "cpu_offline" => OpsContext::CpuOffline,
+            "runnable" => OpsContext::Runnable,
+            "quiescent" => OpsContext::Quiescent,
+            "dequeue" => OpsContext::Dequeue,
+            "enable" => OpsContext::Enable,
             _ => OpsContext::None,
         }
     }
@@ -630,7 +675,44 @@ pub unsafe fn enter_sim(state: &mut SimulatorState, cpu: CpuId) {
 /// the last `resume_timer()` inside `with_sim()`. We must disable it
 /// before returning to Rust engine code to prevent PMU signals from
 /// firing outside of C scheduler code.
+///
+/// Clears `ops_context` after pausing the timer so that any pending PMU
+/// signal (delayed by hardware skid) still sees the correct callback
+/// context. Without this, signals delivered after a manual
+/// `ops_context = None` but before `pause_timer()` would record
+/// `ops=none` instead of the true callback context.
+///
+/// **Not safe for concurrent paths** where another worker may already
+/// hold the token after `finish()`. Use [`exit_sim_no_clear_ops`] in
+/// those cases and clear `ops_context` manually before `finish()`.
 pub fn exit_sim() {
+    crate::preempt::pause_timer();
+    SIM_STATE.with(|cell| {
+        if let Some(ptr) = cell.get() {
+            // Clear ops_context AFTER pausing the timer, so any pending
+            // PMU signal (from the last kfunc's rearm) still sees the
+            // correct callback context rather than None.
+            unsafe {
+                (*ptr).ops_context = OpsContext::None;
+            }
+        }
+        cell.set(None);
+    });
+    // Also clear per-thread TLS so structop boundary detection and the
+    // signal handler see None between callbacks.
+    crate::preempt::set_current_ops_context(OpsContext::None);
+}
+
+/// Like [`exit_sim`] but does **not** clear `ops_context`.
+///
+/// Used in concurrent dispatch/batch paths where `ops_context` must be
+/// cleared manually BEFORE `finish()` to avoid a race: after `finish()`,
+/// another worker already holds the token and may have written
+/// `ops_context = Dispatch` on the shared `SimulatorState`. Writing
+/// `None` from the old worker would clobber the new worker's value,
+/// causing the PMU signal handler to record `ops=none` instead of the
+/// true callback context.
+pub fn exit_sim_no_clear_ops() {
     crate::preempt::pause_timer();
     SIM_STATE.with(|cell| cell.set(None));
 }
@@ -763,7 +845,7 @@ pub extern "C" fn scx_bpf_create_dsq(dsq_id: u64, _node: i32) -> i32 {
         } else {
             -1
         };
-        debug!(dsq_id, result, "kfunc create_dsq");
+        debug!(dsq_id, result, "enter:kfunc create_dsq");
         result
     })
 }
@@ -796,7 +878,7 @@ pub extern "C" fn scx_bpf_select_cpu_dfl(
                 prev_cpu,
                 cpu = prev_cpu,
                 idle = true,
-                "kfunc select_cpu_dfl"
+                "enter:kfunc select_cpu_dfl"
             );
             return prev_cpu;
         }
@@ -812,7 +894,7 @@ pub extern "C" fn scx_bpf_select_cpu_dfl(
                 prev_cpu,
                 cpu = cpu_id.0,
                 idle = true,
-                "kfunc select_cpu_dfl"
+                "enter:kfunc select_cpu_dfl"
             );
             return cpu_id.0 as i32;
         }
@@ -829,7 +911,7 @@ pub extern "C" fn scx_bpf_select_cpu_dfl(
             prev_cpu,
             cpu = fallback,
             idle = false,
-            "kfunc select_cpu_dfl"
+            "enter:kfunc select_cpu_dfl"
         );
         fallback
     })
@@ -878,7 +960,11 @@ pub extern "C" fn scx_bpf_select_cpu_and(
             && in_mask(prev.0)
             && (!want_idle_core || has_idle_core(prev))
         {
-            debug!(prev_cpu, cpu = prev_cpu, "kfunc select_cpu_and (prev idle)");
+            debug!(
+                prev_cpu,
+                cpu = prev_cpu,
+                "enter:kfunc select_cpu_and (prev idle)"
+            );
             return prev_cpu;
         }
 
@@ -890,12 +976,12 @@ pub extern "C" fn scx_bpf_select_cpu_and(
             }
             if sim.cpu_is_idle(cpu) && in_mask(i as u32) && (!want_idle_core || has_idle_core(cpu))
             {
-                debug!(prev_cpu, cpu = i, "kfunc select_cpu_and (found idle)");
+                debug!(prev_cpu, cpu = i, "enter:kfunc select_cpu_and (found idle)");
                 return i as i32;
             }
         }
 
-        debug!(prev_cpu, "kfunc select_cpu_and (no idle)");
+        debug!(prev_cpu, "enter:kfunc select_cpu_and (no idle)");
         -1 // EBUSY
     })
 }
@@ -912,7 +998,7 @@ pub extern "C" fn scx_bpf_dsq_insert(p: *mut c_void, dsq_id: u64, slice: u64, en
     with_sim(kfunc_cost::MODERATE, |sim| {
         let pid = sim.task_pid_from_raw(p);
         unsafe { ffi::sim_task_set_slice(p, slice) };
-        debug!(pid = pid.0, dsq_id, slice = %FmtN(slice), "kfunc dsq_insert");
+        debug!(pid = pid.0, dsq_id, slice = %FmtN(slice), "enter:kfunc dsq_insert");
 
         sim.pending_dispatch = Some(PendingDispatch {
             pid,
@@ -961,7 +1047,7 @@ pub extern "C" fn scx_bpf_dsq_insert_vtime(
     with_sim(kfunc_cost::MODERATE, |sim| {
         let pid = sim.task_pid_from_raw(p);
         unsafe { ffi::sim_task_set_slice(p, slice) };
-        debug!(pid = pid.0, dsq_id, slice = %FmtN(slice), vtime = %Vtime(vtime), "kfunc dsq_insert_vtime");
+        debug!(pid = pid.0, dsq_id, slice = %FmtN(slice), vtime = %Vtime(vtime), "enter:kfunc dsq_insert_vtime");
 
         sim.pending_dispatch = Some(PendingDispatch {
             pid,
@@ -996,7 +1082,7 @@ pub extern "C" fn scx_bpf_dsq_move_to_local(dsq_id: u64) -> bool {
         let cpus_ptr = sim.cpus.as_mut_ptr();
         let cpu = unsafe { &mut *cpus_ptr.add(cpu_idx) };
         let result = sim.dsqs.move_to_local(DsqId(dsq_id), cpu);
-        debug!(dsq_id, result, "kfunc dsq_move_to_local");
+        debug!(dsq_id, result, "enter:kfunc dsq_move_to_local");
 
         let local_t = sim.cpus[cpu_idx].local_clock;
         sim.trace.record(
@@ -1029,20 +1115,20 @@ pub extern "C" fn scx_bpf_dsq_nr_queued(dsq_id: u64) -> i32 {
         if dsq.is_local() {
             let cpu = sim.current_cpu.0 as usize;
             let n = sim.cpus[cpu].local_dsq.len() as i32;
-            debug!(dsq_id, n, "kfunc dsq_nr_queued LOCAL");
+            debug!(dsq_id, n, "enter:kfunc dsq_nr_queued LOCAL");
             return n;
         }
         if dsq.is_local_on() {
             let cpu = dsq.local_on_cpu();
             if (cpu.0 as usize) < sim.cpus.len() {
                 let n = sim.cpus[cpu.0 as usize].local_dsq.len() as i32;
-                debug!(dsq_id, cpu = cpu.0, n, "kfunc dsq_nr_queued LOCAL_ON");
+                debug!(dsq_id, cpu = cpu.0, n, "enter:kfunc dsq_nr_queued LOCAL_ON");
                 return n;
             }
             return 0;
         }
         let n = sim.dsqs.nr_queued(dsq) as i32;
-        debug!(dsq_id, n, "kfunc dsq_nr_queued");
+        debug!(dsq_id, n, "enter:kfunc dsq_nr_queued");
         n
     })
 }
@@ -1160,7 +1246,7 @@ pub extern "C" fn scx_bpf_error_bstr(fmt: *const i8, _data: *const u64, _data_sz
 #[no_mangle]
 pub extern "C" fn scx_bpf_reenqueue_local() -> u32 {
     with_sim(kfunc_cost::TRIVIAL, |sim| {
-        debug!("kfunc reenqueue_local");
+        debug!("enter:kfunc reenqueue_local");
         sim.reenqueue_local_requested = true;
         0
     })
@@ -1546,7 +1632,7 @@ pub extern "C" fn scx_bpf_task_running(p: *const c_void) -> bool {
     with_sim(kfunc_cost::MODERATE, |sim| {
         let pid = sim.task_pid_from_raw(p as *mut c_void);
         let running = sim.cpus.iter().any(|cpu| cpu.current_task == Some(pid));
-        debug!(pid = pid.0, running, "kfunc task_running");
+        debug!(pid = pid.0, running, "enter:kfunc task_running");
         running
     })
 }
@@ -1556,7 +1642,7 @@ pub extern "C" fn scx_bpf_task_running(p: *const c_void) -> bool {
 pub extern "C" fn scx_bpf_nr_cpu_ids() -> u32 {
     with_sim(kfunc_cost::TRIVIAL, |sim| {
         let n = sim.cpus.len() as u32;
-        debug!(n, "kfunc nr_cpu_ids");
+        debug!(n, "enter:kfunc nr_cpu_ids");
         n
     })
 }

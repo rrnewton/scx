@@ -821,6 +821,15 @@ pub fn set_current_ops_context(ctx: OpsContext) {
     CURRENT_OPS_CONTEXT.with(|c| c.set(ctx));
 }
 
+/// Read the per-thread cached ops context.
+///
+/// Used by the PMU signal handler to get ops_context without reading
+/// shared `SimulatorState` (which may have been modified by another
+/// worker during a yield).
+pub fn current_ops_context() -> OpsContext {
+    CURRENT_OPS_CONTEXT.with(|c| c.get())
+}
+
 // ---------------------------------------------------------------------------
 // ASLR base detection — .so-relative RIP offsets
 // ---------------------------------------------------------------------------
@@ -1426,13 +1435,15 @@ extern "C" fn preempt_handler(
         None => return,
     };
 
-    let (saved_cpu, saved_ops_ctx, saved_waker) = unsafe {
-        (
-            (*sim_ptr).current_cpu,
-            (*sim_ptr).ops_context,
-            (*sim_ptr).waker_task_raw,
-        )
-    };
+    // Read ops_context from per-thread TLS rather than the shared
+    // SimulatorState. The shared state may have been modified by
+    // another worker that ran while this worker was yielded (e.g.
+    // Worker B's exit_sim cleared ops_context to None). The TLS
+    // copy was set by set_ops_context() when the engine entered
+    // this callback, so it reflects this worker's true context.
+    let saved_ops_ctx = current_ops_context();
+
+    let (saved_cpu, saved_waker) = unsafe { ((*sim_ptr).current_cpu, (*sim_ptr).waker_task_raw) };
 
     // 4. Track structop RBC.
     //    NOTE: Do NOT call tracing::trace!() here — tracing uses internal
