@@ -13,8 +13,12 @@ echo "=== Running cargo clippy ==="
 cargo clippy --all -- -D warnings
 
 echo ""
-echo "=== Running cargo test ==="
-cargo test --all
+echo "=== Running cargo nextest ==="
+cargo nextest run --workspace
+
+echo ""
+echo "=== Running doc-tests ==="
+cargo test --workspace --doc
 
 echo ""
 echo "=== All checks passed ==="
