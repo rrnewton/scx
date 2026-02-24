@@ -1114,7 +1114,7 @@ mod tests {
 
         // Install SIGTRAP handler.
         let sa = libc::sigaction {
-            sa_sigaction: trap_handler as libc::sighandler_t,
+            sa_sigaction: trap_handler as *const () as libc::sighandler_t,
             sa_mask: unsafe { std::mem::zeroed() },
             sa_flags: 0,
             sa_restorer: None,
@@ -1186,7 +1186,7 @@ mod tests {
 
         // Install SIGTRAP handler with SA_SIGINFO to get siginfo_t.
         let sa = libc::sigaction {
-            sa_sigaction: siginfo_handler as libc::sighandler_t,
+            sa_sigaction: siginfo_handler as *const () as libc::sighandler_t,
             sa_mask: unsafe { std::mem::zeroed() },
             sa_flags: libc::SA_SIGINFO,
             sa_restorer: None,
