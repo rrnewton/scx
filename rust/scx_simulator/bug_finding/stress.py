@@ -18,6 +18,7 @@ import os
 import random
 import signal
 import subprocess
+import tempfile
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -209,11 +210,88 @@ def classify_error(returncode: int, stderr: str) -> str:
         return "other"
 
 
+def run_determinism_preemptive(config: TestConfig) -> Optional[Finding]:
+    """Record preemption points in run 1, replay them in run 2, compare."""
+    start = time.monotonic()
+    tmpfile = None
+    try:
+        tmpfile = tempfile.NamedTemporaryFile(
+            suffix=".preempt", delete=False, prefix="scxsim_"
+        )
+        tmpfile.close()
+
+        # Run 1: record preemption points (nondeterministic PMU)
+        cmd1 = build_base_cmd(config) + ["--record-preemptions", tmpfile.name]
+        result1 = subprocess.run(
+            cmd1, capture_output=True, text=True, timeout=PROCESS_TIMEOUT_SEC
+        )
+        if result1.returncode != 0:
+            elapsed = time.monotonic() - start
+            error_type = classify_error(result1.returncode, result1.stderr)
+            return Finding(
+                config=config,
+                error_type=f"record_{error_type}",
+                exit_code=result1.returncode,
+                stderr=result1.stderr.strip(),
+                stdout=result1.stdout.strip(),
+                wall_time_sec=elapsed,
+            )
+
+        # Run 2: replay preemption points (deterministic hw breakpoint)
+        cmd2 = build_base_cmd(config) + ["--replay-preemptions", tmpfile.name]
+        result2 = subprocess.run(
+            cmd2, capture_output=True, text=True, timeout=PROCESS_TIMEOUT_SEC
+        )
+        elapsed = time.monotonic() - start
+
+        if result2.returncode != 0:
+            error_type = classify_error(result2.returncode, result2.stderr)
+            return Finding(
+                config=config,
+                error_type=f"replay_{error_type}",
+                exit_code=result2.returncode,
+                stderr=result2.stderr.strip(),
+                stdout=result2.stdout.strip(),
+                wall_time_sec=elapsed,
+            )
+
+        # Both runs succeeded — determinism check passed
+        return None
+
+    except subprocess.TimeoutExpired:
+        elapsed = time.monotonic() - start
+        return Finding(
+            config=config,
+            error_type="timeout",
+            exit_code=-1,
+            stderr=f"process timed out after {PROCESS_TIMEOUT_SEC}s",
+            stdout="",
+            wall_time_sec=elapsed,
+        )
+    except Exception as e:
+        elapsed = time.monotonic() - start
+        return Finding(
+            config=config,
+            error_type="other",
+            exit_code=-1,
+            stderr=str(e),
+            stdout="",
+            wall_time_sec=elapsed,
+        )
+    finally:
+        if tmpfile and os.path.exists(tmpfile.name):
+            os.unlink(tmpfile.name)
+
+
 def run_one(config: TestConfig) -> Optional[Finding]:
     """Run a single simulation and return a Finding if it fails."""
+    # In determinism mode with preemptive configs, use record+replay.
+    if DETERMINISM_MODE and config.interleave_mode == "preemptive":
+        return run_determinism_preemptive(config)
+
     cmd = build_base_cmd(config)
 
-    # In determinism mode, use --determinism-check flag
+    # In determinism mode (cooperative/off), use --determinism-check flag
     if DETERMINISM_MODE:
         cmd.append("--determinism-check")
 

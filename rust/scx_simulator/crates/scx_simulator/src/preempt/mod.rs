@@ -1731,6 +1731,320 @@ fn rearm_timer(ring: &PreemptRing, ctx: &PreemptCtx) {
 }
 
 // ---------------------------------------------------------------------------
+// Replay engine — hybrid PMU + hardware breakpoint
+// ---------------------------------------------------------------------------
+
+/// Margin (in retired conditional branches) before the target at which the
+/// PMU timer fires, giving us time to arm the hardware breakpoint.
+///
+/// Must be well above typical PMU skid (~30-100 branches). 200 provides
+/// comfortable headroom.
+pub const REPLAY_MARGIN: u64 = 200;
+
+/// The signal used by hardware breakpoints in replay mode.
+pub const REPLAY_BP_SIGNAL: libc::c_int = libc::SIGTRAP;
+
+/// Signal-safe cursor into a worker's replay trace.
+///
+/// Tracks which preemption target is next and accumulates signal-handler
+/// overhead for rdpmc accounting. All mutable state uses atomics for
+/// signal-handler safety.
+pub struct ReplayCursor {
+    /// The preemption targets for this worker.
+    targets: Vec<PreemptionRecord>,
+    /// Index of the next target (atomic for signal-handler access).
+    next_idx: AtomicUsize,
+    /// Accumulated signal handler branch overhead (for rdpmc accounting).
+    total_overhead: AtomicU64,
+}
+
+impl ReplayCursor {
+    /// Create a cursor from a worker's trace slice.
+    pub fn new(targets: Vec<PreemptionRecord>) -> Self {
+        ReplayCursor {
+            targets,
+            next_idx: AtomicUsize::new(0),
+            total_overhead: AtomicU64::new(0),
+        }
+    }
+
+    /// Get the next target, if any remain.
+    pub fn current_target(&self) -> Option<&PreemptionRecord> {
+        let idx = self.next_idx.load(SeqCst);
+        self.targets.get(idx)
+    }
+
+    /// Advance to the next target. Returns true if there are more targets.
+    fn advance(&self) -> bool {
+        let idx = self.next_idx.fetch_add(1, SeqCst) + 1;
+        idx < self.targets.len()
+    }
+
+    /// Number of targets in this cursor.
+    pub fn len(&self) -> usize {
+        self.targets.len()
+    }
+
+    /// Whether there are no targets.
+    pub fn is_empty(&self) -> bool {
+        self.targets.is_empty()
+    }
+
+    /// Accumulated overhead branches from signal-handler execution.
+    #[allow(dead_code)] // Infrastructure for rdpmc accounting.
+    pub fn overhead(&self) -> u64 {
+        self.total_overhead.load(SeqCst)
+    }
+}
+
+/// Thread-local context for a worker in REPLAY mode.
+#[derive(Clone, Copy)]
+struct ReplayCtx {
+    ring: *const PreemptRing,
+    worker_id: WorkerId,
+    /// Raw fd of the RBC timer.
+    timer_fd: RawFd,
+    /// Raw fd of the hardware breakpoint.
+    bp_fd: RawFd,
+    /// Pointer to the per-worker replay cursor.
+    /// Raw pointer because it must be accessible from a signal handler.
+    cursor: *const ReplayCursor,
+}
+
+// Raw pointers are Send — access serialized by token passing.
+unsafe impl Send for ReplayCtx {}
+
+thread_local! {
+    static REPLAY_CTX: Cell<Option<ReplayCtx>> = const { Cell::new(None) };
+}
+
+/// Install replay context on the current worker thread.
+pub fn install_replay(
+    ring: &PreemptRing,
+    worker_id: WorkerId,
+    timer_fd: RawFd,
+    bp_fd: RawFd,
+    cursor: &ReplayCursor,
+) {
+    REPLAY_CTX.with(|c| {
+        c.set(Some(ReplayCtx {
+            ring: ring as *const PreemptRing,
+            worker_id,
+            timer_fd,
+            bp_fd,
+            cursor: cursor as *const ReplayCursor,
+        }));
+    });
+}
+
+/// Remove replay context from the current thread.
+pub fn uninstall_replay() {
+    REPLAY_CTX.with(|c| c.set(None));
+}
+
+/// Install the process-wide replay signal handlers.
+///
+/// Installs both the PMU handler (SIGSTKFLT) and the breakpoint handler
+/// (SIGTRAP). Must be called before spawning worker threads.
+pub fn install_replay_signal_handlers() {
+    // PMU handler: fires when we're within MARGIN of the target.
+    let sa_pmu = libc::sigaction {
+        sa_sigaction: replay_pmu_handler as *const () as libc::sighandler_t,
+        sa_mask: unsafe { std::mem::zeroed() },
+        sa_flags: libc::SA_SIGINFO | libc::SA_RESTART,
+        sa_restorer: None,
+    };
+    let ret = unsafe { libc::sigaction(PREEMPT_SIGNAL, &sa_pmu, std::ptr::null_mut()) };
+    assert_eq!(ret, 0, "failed to install replay PMU handler");
+
+    // Breakpoint handler: fires when we hit the target instruction.
+    let sa_bp = libc::sigaction {
+        sa_sigaction: replay_bp_handler as *const () as libc::sighandler_t,
+        sa_mask: unsafe { std::mem::zeroed() },
+        sa_flags: libc::SA_SIGINFO | libc::SA_RESTART,
+        sa_restorer: None,
+    };
+    let ret = unsafe { libc::sigaction(REPLAY_BP_SIGNAL, &sa_bp, std::ptr::null_mut()) };
+    assert_eq!(ret, 0, "failed to install replay breakpoint handler");
+}
+
+/// Remove the replay signal handlers, restoring default behavior.
+pub fn uninstall_replay_signal_handlers() {
+    let sa_default = libc::sigaction {
+        sa_sigaction: libc::SIG_DFL,
+        sa_mask: unsafe { std::mem::zeroed() },
+        sa_flags: 0,
+        sa_restorer: None,
+    };
+    unsafe {
+        libc::sigaction(PREEMPT_SIGNAL, &sa_default, std::ptr::null_mut());
+        libc::sigaction(REPLAY_BP_SIGNAL, &sa_default, std::ptr::null_mut());
+    }
+}
+
+/// Arm the PMU timer for the next replay target.
+///
+/// Sets the timer to fire at `target_rbc - REPLAY_MARGIN` branches from
+/// the current counter position (which is reset to zero).
+fn arm_replay_timer(timer_fd: RawFd, target_rbc: u64) {
+    if timer_fd < 0 {
+        return;
+    }
+    let mut period = target_rbc.saturating_sub(REPLAY_MARGIN).max(1);
+    unsafe {
+        libc::ioctl(timer_fd, scx_perf::PERF_IOC_RESET, 0 as libc::c_ulong);
+        libc::ioctl(timer_fd, scx_perf::PERF_IOC_PERIOD, &mut period as *mut u64);
+        libc::ioctl(timer_fd, scx_perf::PERF_IOC_ENABLE, 0 as libc::c_ulong);
+    }
+}
+
+/// Public wrapper for [`arm_replay_timer`], used by the backend to arm the
+/// first replay target before entering scheduler C code.
+pub fn arm_replay_timer_pub(timer_fd: RawFd, target_rbc: u64) {
+    arm_replay_timer(timer_fd, target_rbc);
+}
+
+/// Arm the hardware breakpoint at the given instruction pointer.
+fn arm_breakpoint(bp_fd: RawFd, addr: u64) {
+    if bp_fd < 0 || addr == 0 {
+        return;
+    }
+    // Build a fresh perf_event_attr for the new address.
+    let mut attr = perf_event_open_sys::bindings::perf_event_attr {
+        type_: perf_event_open_sys::bindings::PERF_TYPE_BREAKPOINT,
+        size: std::mem::size_of::<perf_event_open_sys::bindings::perf_event_attr>() as u32,
+        bp_type: perf_event_open_sys::bindings::HW_BREAKPOINT_X,
+        ..Default::default()
+    };
+    attr.__bindgen_anon_3.bp_addr = addr;
+    attr.__bindgen_anon_4.bp_len = perf_event_open_sys::bindings::HW_BREAKPOINT_LEN_8 as u64;
+    attr.__bindgen_anon_1.sample_period = 1;
+    attr.__bindgen_anon_2.wakeup_events = 1;
+    attr.set_disabled(0); // enable immediately after modify
+    attr.set_exclude_kernel(1);
+    attr.set_exclude_hv(1);
+    attr.set_pinned(1);
+
+    unsafe {
+        libc::ioctl(
+            bp_fd,
+            scx_perf::PERF_IOC_MODIFY_ATTRIBUTES,
+            &mut attr as *mut perf_event_open_sys::bindings::perf_event_attr,
+        );
+        libc::ioctl(bp_fd, scx_perf::PERF_IOC_ENABLE, 0 as libc::c_ulong);
+    }
+}
+
+/// PMU signal handler for replay mode (SIGSTKFLT).
+///
+/// Fires when we're within REPLAY_MARGIN branches of the target. Arms
+/// the hardware breakpoint at the target's instruction pointer.
+///
+/// All operations are async-signal-safe.
+extern "C" fn replay_pmu_handler(
+    _signo: libc::c_int,
+    _info: *mut libc::siginfo_t,
+    _ctx: *mut libc::c_void,
+) {
+    let rctx = REPLAY_CTX.with(|c| c.get());
+    let rctx = match rctx {
+        Some(ctx) => ctx,
+        None => return,
+    };
+
+    // 1. Disable PMU timer to prevent recursive signals.
+    disable_timer(rctx.timer_fd);
+
+    // 2. Look up the next target from the cursor.
+    let cursor = unsafe { &*rctx.cursor };
+    let target = match cursor.current_target() {
+        Some(t) => t,
+        None => return, // No more targets.
+    };
+
+    // 3. Arm the hardware breakpoint at the target instruction pointer.
+    arm_breakpoint(rctx.bp_fd, target.instruction_pointer);
+
+    // 4. Return from signal handler — execution resumes with breakpoint armed.
+}
+
+/// Breakpoint signal handler for replay mode (SIGTRAP).
+///
+/// Fires when execution hits the target instruction pointer. Preempts
+/// the worker by yielding the token, then arms the timer for the next
+/// target (if any).
+///
+/// All operations are async-signal-safe.
+extern "C" fn replay_bp_handler(
+    _signo: libc::c_int,
+    _info: *mut libc::siginfo_t,
+    _ctx: *mut libc::c_void,
+) {
+    let rctx = REPLAY_CTX.with(|c| c.get());
+    let rctx = match rctx {
+        Some(ctx) => ctx,
+        None => return,
+    };
+
+    let cursor = unsafe { &*rctx.cursor };
+    let ring = unsafe { &*rctx.ring };
+
+    // 1. Disable breakpoint to prevent re-firing immediately.
+    disable_timer(rctx.bp_fd);
+
+    // 2. Read the current target (should exist since the PMU handler armed us).
+    let target = match cursor.current_target() {
+        Some(t) => *t,
+        None => return,
+    };
+
+    // 3. Save SimulatorState context.
+    let sim_ptr = match crate::kfuncs::sim_state_ptr() {
+        Some(p) => p,
+        None => return,
+    };
+    let (saved_cpu, saved_ops_ctx, saved_waker) = unsafe {
+        (
+            (*sim_ptr).current_cpu,
+            (*sim_ptr).ops_context,
+            (*sim_ptr).waker_task_raw,
+        )
+    };
+
+    // 4. Track structop RBC.
+    record_rbc_preemption(target.rbc_count);
+    set_current_ops_context(saved_ops_ctx);
+    let sinfo = structop_info();
+
+    // 4a. Record the preemption point (with structop context).
+    ring.record_preemption(
+        target.rbc_count,
+        target.instruction_pointer,
+        saved_cpu,
+        rctx.worker_id,
+        sinfo,
+    );
+
+    // 5. Yield token (futex-based, signal-safe).
+    ring.inc_signal_preempt();
+    ring.yield_token(rctx.worker_id);
+
+    // 6. Resumed — restore SimulatorState context.
+    unsafe {
+        (*sim_ptr).current_cpu = saved_cpu;
+        (*sim_ptr).ops_context = saved_ops_ctx;
+        (*sim_ptr).waker_task_raw = saved_waker;
+    }
+
+    // 7. Advance cursor and arm timer for next target.
+    if cursor.advance() {
+        if let Some(next) = cursor.current_target() {
+            arm_replay_timer(rctx.timer_fd, next.rbc_count);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

@@ -11,6 +11,9 @@ use rand::rngs::SmallRng;
 use rand::{RngCore, SeedableRng};
 use tracing::{debug, info, trace, warn};
 
+use crate::backend::pmu::PmuBackend;
+use crate::backend::replay::ReplayBackend;
+use crate::backend::SendPtr;
 use crate::cgroup::{clear_cgroup_registry, install_cgroup_registry, CgroupId, CgroupRegistry};
 use crate::cpu::{IrqContext, LastStopReason, SimCpu};
 use crate::dsq::DsqManager;
@@ -69,46 +72,6 @@ impl ExitKind {
     }
 }
 
-/// Wrapper for raw pointers that need to cross thread boundaries.
-///
-/// SAFETY: only sound when the caller ensures exclusive access (e.g.,
-/// via token passing where only one thread is active at a time).
-struct SendPtr<T>(*mut T);
-unsafe impl<T> Send for SendPtr<T> {}
-unsafe impl<T> Sync for SendPtr<T> {}
-
-/// Create and configure a per-thread PMU timer for preemptive interleaving.
-///
-/// Returns `(Option<RbcTimer>, RawFd)`. The timer is created using the given
-/// `break_on` event type. If `cooperative_only` is true, or if the PMU is
-/// unavailable, returns `(None, -1)`.
-///
-/// Must be called from the worker thread (routes signal delivery to current tid).
-fn setup_pmu_timer(
-    cooperative_only: bool,
-    break_on: perf::PmuEvent,
-) -> (Option<perf::RbcTimer>, std::os::unix::io::RawFd) {
-    use crate::preempt;
-
-    if cooperative_only {
-        return (None, -1);
-    }
-    let timer = perf::try_create_pmu_timer(break_on);
-    let timer_fd = match &timer {
-        Some(t) => {
-            let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::pid_t;
-            if let Err(e) = t.set_signal_delivery(tid, preempt::PREEMPT_SIGNAL) {
-                tracing::warn!("preemptive: signal delivery setup failed: {e}");
-                -1
-            } else {
-                t.raw_fd()
-            }
-        }
-        None => -1,
-    };
-    (timer, timer_fd)
-}
-
 /// SCX wake flags.
 const SCX_ENQ_WAKEUP: u64 = 0x1;
 /// Synchronous wakeup: waker is about to sleep/yield, hinting the scheduler
@@ -128,7 +91,7 @@ const SCX_DSP_MAX_LOOPS: u32 = 32;
 
 /// A simulation event, ordered by timestamp then tiebreaker.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Event {
+pub(crate) struct Event {
     time_ns: TimeNs,
     /// Tiebreaker for events at the same time (lower = higher priority).
     /// In fixed-priority mode, this is a monotonic counter (insertion order).
@@ -163,7 +126,7 @@ impl PartialOrd for Event {
 ///
 /// The event PRNG is separate from `SimulatorState::rng` so that
 /// adding/removing events does not perturb the scheduler's PRNG sequence.
-struct EventQueue {
+pub(crate) struct EventQueue {
     heap: BinaryHeap<Reverse<Event>>,
     /// Monotonic counter for unique event identity / fixed-priority ordering.
     seq: u64,
@@ -572,7 +535,11 @@ fn maybe_record_checkpoint(state: &SimulatorState, event: CheckpointEvent, cpu: 
 ///
 /// `sp` must point to a valid `SimulatorState` and `schp` to a valid scheduler.
 /// Must be called inside an `enter_sim` / `exit_sim` scope.
-unsafe fn dispatch_worker_body<S: Scheduler>(sp: *mut SimulatorState, schp: *const S, cpu: CpuId) {
+pub(crate) unsafe fn dispatch_worker_body<S: Scheduler>(
+    sp: *mut SimulatorState,
+    schp: *const S,
+    cpu: CpuId,
+) {
     let sim = &mut *sp;
     sim.current_cpu = cpu;
     set_ops_context(sim, OpsContext::Dispatch);
@@ -596,7 +563,7 @@ unsafe fn dispatch_worker_body<S: Scheduler>(sp: *mut SimulatorState, schp: *con
 /// All pointer arguments must point to valid, exclusively-accessible data.
 /// Must be called inside an `enter_sim` / `exit_sim` scope.
 #[allow(clippy::too_many_arguments)]
-unsafe fn batch_worker_body<S: Scheduler>(
+pub(crate) unsafe fn batch_worker_body<S: Scheduler>(
     simp: *const Simulator<S>,
     sp: *mut SimulatorState,
     tasks: *mut HashMap<Pid, SimTask>,
@@ -850,6 +817,7 @@ impl<S: Scheduler> Simulator<S> {
             bpf_error: None,
             interleave: scenario.interleave,
             preemptive: scenario.preemptive.clone(),
+            replay_trace: scenario.replay_trace.clone(),
             structop_accum: vec![
                 crate::preempt::StructopInfo::default();
                 scenario.nr_cpus as usize
@@ -2948,20 +2916,30 @@ impl<S: Scheduler> Simulator<S> {
         let interleave_seed = state.next_prng();
 
         if let Some(ref preemptive_cfg) = state.preemptive {
-            let timeslice_min = preemptive_cfg.timeslice_min;
-            let timeslice_max = preemptive_cfg.timeslice_max;
-            let cooperative_only = preemptive_cfg.cooperative_only;
-            let break_on = preemptive_cfg.break_on;
-            self.dispatch_concurrent_preemptive(
-                &dispatch_cpus,
-                &state_send,
-                &sched_send,
-                interleave_seed,
-                timeslice_min,
-                timeslice_max,
-                cooperative_only,
-                break_on,
-            );
+            if let Some(ref trace) = state.replay_trace {
+                let backend = ReplayBackend::new(trace, dispatch_cpus.len());
+                crate::backend::run_preemptive_dispatch(
+                    &dispatch_cpus,
+                    &state_send,
+                    &sched_send,
+                    interleave_seed,
+                    &backend,
+                );
+            } else {
+                let backend = PmuBackend {
+                    timeslice_min: preemptive_cfg.timeslice_min,
+                    timeslice_max: preemptive_cfg.timeslice_max,
+                    cooperative_only: preemptive_cfg.cooperative_only,
+                    break_on: preemptive_cfg.break_on,
+                };
+                crate::backend::run_preemptive_dispatch(
+                    &dispatch_cpus,
+                    &state_send,
+                    &sched_send,
+                    interleave_seed,
+                    &backend,
+                );
+            }
         } else {
             self.dispatch_concurrent_cooperative(
                 &dispatch_cpus,
@@ -3071,168 +3049,6 @@ impl<S: Scheduler> Simulator<S> {
         });
     }
 
-    /// Phase 1 preemptive: run dispatch via `PreemptRing` + PMU timer.
-    ///
-    /// Each worker yields at kfunc boundaries (cooperative) AND is also
-    /// preempted mid-C-code by a PMU timer overflow signal. If the PMU
-    /// is unavailable (VMs, containers), falls back to cooperative-only
-    /// interleaving with the `PreemptRing`.
-    #[allow(clippy::too_many_arguments)]
-    fn dispatch_concurrent_preemptive(
-        &self,
-        dispatch_cpus: &[CpuId],
-        state_send: &SendPtr<SimulatorState>,
-        sched_send: &SendPtr<S>,
-        seed: u32,
-        timeslice_min: u64,
-        timeslice_max: u64,
-        cooperative_only: bool,
-        break_on: crate::perf::PmuEvent,
-    ) {
-        use crate::interleave::WorkerId;
-        use crate::preempt::{self, PreemptRing};
-
-        let ring = PreemptRing::new(dispatch_cpus.len(), seed);
-        debug!(
-            workers = dispatch_cpus.len(),
-            timeslice_min,
-            timeslice_max,
-            seed,
-            cpus = ?dispatch_cpus.iter().map(|c| c.0).collect::<Vec<_>>(),
-            "preemptive interleave: starting dispatch"
-        );
-        preempt::install_signal_handler();
-
-        std::thread::scope(|s| {
-            let ring_ref = &ring;
-            // Capture &SendPtr (which is Send+Sync) rather than raw
-            // pointers (which are !Send).
-            let state_ref = state_send;
-            let sched_ref = sched_send;
-
-            for (i, &cpu) in dispatch_cpus.iter().enumerate() {
-                let worker_id = WorkerId(i);
-
-                s.spawn(move || {
-                    let sp = state_ref.0;
-                    let schp = sched_ref.0 as *const S;
-
-                    // Create per-thread PMU timer (may be unavailable in VMs).
-                    // Skip if cooperative_only mode is requested.
-                    let (timer, timer_fd) = setup_pmu_timer(cooperative_only, break_on);
-
-                    // Create per-thread RBC measurement counter (separate from
-                    // the preemption timer). This counts cumulative C-code RBC
-                    // with pauses during kfuncs, matching non-preemptive mode.
-                    let measure_counter = perf::try_create_rbc_counter();
-                    let measure_fd = measure_counter.as_ref().map_or(-1, |c| c.raw_fd());
-
-                    if cooperative_only {
-                        debug!(
-                            worker = i,
-                            cpu = cpu.0,
-                            "preempt: cooperative-only (by config)"
-                        );
-                    } else if timer_fd >= 0 {
-                        debug!(worker = i, cpu = cpu.0, %break_on, "preempt: PMU timer armed");
-                    } else {
-                        debug!(
-                            worker = i,
-                            cpu = cpu.0,
-                            "preempt: PMU unavailable, cooperative-only"
-                        );
-                    }
-                    preempt::install(
-                        ring_ref,
-                        worker_id,
-                        timer_fd,
-                        measure_fd,
-                        timeslice_min,
-                        timeslice_max,
-                    );
-
-                    ring_ref.wait_for_token(worker_id);
-
-                    // Enter sim AFTER acquiring the token to avoid racing on
-                    // SimulatorState.current_cpu with other workers.
-                    unsafe { kfuncs::enter_sim(&mut *sp, cpu) };
-
-                    // Arm the PMU timer before entering scheduler C code.
-                    if timer_fd >= 0 {
-                        let ts = ring_ref.roll_timeslice(timeslice_min, timeslice_max);
-                        if let Some(ref t) = timer {
-                            let _ = t.reset();
-                            let _ = t.set_period(ts);
-                            let _ = t.enable();
-                        }
-                    }
-
-                    // Enable measurement counter before entering C code.
-                    if let Some(ref mc) = measure_counter {
-                        let _ = mc.reset();
-                        let _ = mc.enable();
-                    }
-
-                    unsafe {
-                        debug!(cpu = cpu.0, "enter:structop dispatch (preemptive)");
-                        dispatch_worker_body(sp, schp, cpu);
-                    }
-
-                    // Disable timer before finishing.
-                    if let Some(ref t) = timer {
-                        let _ = t.disable();
-                    }
-
-                    // Disable and read the measurement counter. This gives
-                    // cumulative C-code-only RBC (kfuncs were excluded by
-                    // pause_measurement/resume_measurement in with_sim).
-                    if let Some(ref mc) = measure_counter {
-                        let _ = mc.disable();
-                        let rbc = mc.read().unwrap_or(0);
-                        unsafe {
-                            let idx = cpu.0 as usize;
-                            if idx < (*sp).structop_accum.len() {
-                                (&mut (*sp).structop_accum)[idx].rbc_total += rbc;
-                            }
-                        }
-                    }
-
-                    // Drain per-worker interleave count into structop accumulator.
-                    unsafe {
-                        let idx = cpu.0 as usize;
-                        if idx < (*sp).structop_accum.len() {
-                            (&mut (*sp).structop_accum)[idx].interleave_count +=
-                                preempt::structop_info().interleave_count;
-                        }
-                    }
-
-                    // Clear ops_context AFTER disabling the timer (so
-                    // pending PMU signals still see the true callback
-                    // context) and BEFORE releasing the token (so the new
-                    // token holder's ops_context isn't clobbered by our
-                    // exit_sim writing to shared state).
-                    unsafe { (*sp).ops_context = OpsContext::None };
-                    crate::preempt::set_current_ops_context(OpsContext::None);
-                    ring_ref.finish(worker_id);
-                    kfuncs::exit_sim_no_clear_ops();
-
-                    preempt::uninstall();
-                    // timer + measure_counter dropped here — closes the perf fds
-                });
-            }
-
-            ring.start();
-            ring.wait_all_done();
-        });
-
-        debug!(
-            signal_preemptions = ring.signal_preemptions(),
-            cooperative_yields = ring.cooperative_yields(),
-            "preemptive interleave: dispatch complete"
-        );
-        preempt::uninstall_signal_handler();
-    }
-
     /// Process per-CPU events at the same timestamp concurrently.
     ///
     /// Each CPU's events are handled on a separate OS thread, interleaved
@@ -3311,23 +3127,44 @@ impl<S: Scheduler> Simulator<S> {
         let cgroup_send = SendPtr(cgroup_registry as *mut CgroupRegistry);
 
         if let Some(ref preemptive_cfg) = state.preemptive.clone() {
-            Self::process_batch_concurrent_preemptive(
-                per_cpu,
-                &cpu_ids,
-                &sim_send,
-                &state_send,
-                &tasks_send,
-                &events_send,
-                &cgroup_send,
-                interleave_seed,
-                watchdog_timeout,
-                duration_ns,
-                max_cgroups,
-                preemptive_cfg.timeslice_min,
-                preemptive_cfg.timeslice_max,
-                preemptive_cfg.cooperative_only,
-                preemptive_cfg.break_on,
-            );
+            if let Some(ref trace) = state.replay_trace {
+                let backend = ReplayBackend::new(trace, cpu_ids.len());
+                crate::backend::run_preemptive_batch(
+                    &per_cpu,
+                    &cpu_ids,
+                    &sim_send,
+                    &state_send,
+                    &tasks_send,
+                    &events_send,
+                    &cgroup_send,
+                    interleave_seed,
+                    watchdog_timeout,
+                    duration_ns,
+                    max_cgroups,
+                    &backend,
+                );
+            } else {
+                let backend = PmuBackend {
+                    timeslice_min: preemptive_cfg.timeslice_min,
+                    timeslice_max: preemptive_cfg.timeslice_max,
+                    cooperative_only: preemptive_cfg.cooperative_only,
+                    break_on: preemptive_cfg.break_on,
+                };
+                crate::backend::run_preemptive_batch(
+                    &per_cpu,
+                    &cpu_ids,
+                    &sim_send,
+                    &state_send,
+                    &tasks_send,
+                    &events_send,
+                    &cgroup_send,
+                    interleave_seed,
+                    watchdog_timeout,
+                    duration_ns,
+                    max_cgroups,
+                    &backend,
+                );
+            }
         } else {
             Self::process_batch_concurrent_cooperative(
                 per_cpu,
@@ -3437,148 +3274,6 @@ impl<S: Scheduler> Simulator<S> {
             workers = cpu_ids.len(),
             "batch-concurrent cooperative: complete"
         );
-    }
-
-    /// Preemptive batch-concurrent processing via `PreemptRing` + PMU timer.
-    #[allow(clippy::too_many_arguments)]
-    fn process_batch_concurrent_preemptive(
-        per_cpu: HashMap<CpuId, Vec<Event>>,
-        cpu_ids: &[CpuId],
-        sim_send: &SendPtr<Simulator<S>>,
-        state_send: &SendPtr<SimulatorState>,
-        tasks_send: &SendPtr<HashMap<Pid, SimTask>>,
-        events_send: &SendPtr<EventQueue>,
-        cgroup_send: &SendPtr<CgroupRegistry>,
-        seed: u32,
-        watchdog_timeout: Option<TimeNs>,
-        duration_ns: TimeNs,
-        max_cgroups: u32,
-        timeslice_min: u64,
-        timeslice_max: u64,
-        cooperative_only: bool,
-        break_on: crate::perf::PmuEvent,
-    ) {
-        use crate::interleave::WorkerId;
-        use crate::preempt::{self, PreemptRing};
-
-        let ring = PreemptRing::new(cpu_ids.len(), seed);
-        preempt::install_signal_handler();
-
-        std::thread::scope(|s| {
-            let ring_ref = &ring;
-            let sim_ref = sim_send;
-            let state_ref = state_send;
-            let tasks_ref = tasks_send;
-            let events_ref = events_send;
-            let cgroup_ref = cgroup_send;
-            let per_cpu_ref = &per_cpu;
-
-            for (i, &cpu) in cpu_ids.iter().enumerate() {
-                let worker_id = WorkerId(i);
-                let cpu_events = per_cpu_ref.get(&cpu).cloned().unwrap_or_default();
-
-                s.spawn(move || {
-                    let simp = sim_ref.0 as *const Simulator<S>;
-                    let sp = state_ref.0;
-
-                    // Create per-thread PMU timer.
-                    // Skip if cooperative_only mode is requested.
-                    let (timer, timer_fd) = setup_pmu_timer(cooperative_only, break_on);
-
-                    // Create per-thread RBC measurement counter.
-                    let measure_counter = perf::try_create_rbc_counter();
-                    let measure_fd = measure_counter.as_ref().map_or(-1, |c| c.raw_fd());
-
-                    preempt::install(
-                        ring_ref,
-                        worker_id,
-                        timer_fd,
-                        measure_fd,
-                        timeslice_min,
-                        timeslice_max,
-                    );
-
-                    ring_ref.wait_for_token(worker_id);
-
-                    // Enter sim AFTER acquiring the token to avoid racing on
-                    // SimulatorState.current_cpu with other workers.
-                    unsafe { kfuncs::enter_sim(&mut *sp, cpu) };
-
-                    // Enable measurement counter before entering scheduler code.
-                    if let Some(ref mc) = measure_counter {
-                        let _ = mc.reset();
-                        let _ = mc.enable();
-                    }
-
-                    // Don't arm the PMU timer upfront. Unlike
-                    // dispatch_concurrent_preemptive (which runs a tight
-                    // C-only loop), batch workers run full handler chains
-                    // that include Rust engine code (advance_cpu_clock,
-                    // enter_sim, exit_sim). The timer is armed naturally
-                    // by with_sim's resume_timer() after each kfunc call,
-                    // ensuring it only fires during C scheduler code.
-
-                    unsafe {
-                        batch_worker_body(
-                            simp,
-                            sp,
-                            tasks_ref.0,
-                            events_ref.0,
-                            cgroup_ref.0,
-                            cpu_events,
-                            watchdog_timeout,
-                            duration_ns,
-                            max_cgroups,
-                        );
-                    }
-
-                    if let Some(ref t) = timer {
-                        let _ = t.disable();
-                    }
-
-                    // Read cumulative C-code RBC from measurement counter.
-                    if let Some(ref mc) = measure_counter {
-                        let _ = mc.disable();
-                        let rbc = mc.read().unwrap_or(0);
-                        unsafe {
-                            let idx = cpu.0 as usize;
-                            if idx < (*sp).structop_accum.len() {
-                                (&mut (*sp).structop_accum)[idx].rbc_total += rbc;
-                            }
-                        }
-                    }
-
-                    // Drain per-worker interleave count into structop accumulator.
-                    unsafe {
-                        let idx = cpu.0 as usize;
-                        if idx < (*sp).structop_accum.len() {
-                            (&mut (*sp).structop_accum)[idx].interleave_count +=
-                                preempt::structop_info().interleave_count;
-                        }
-                    }
-
-                    // Clear ops_context after timer disable, before token
-                    // release (same pattern as dispatch_concurrent_preemptive).
-                    unsafe { (*sp).ops_context = OpsContext::None };
-                    crate::preempt::set_current_ops_context(OpsContext::None);
-                    ring_ref.finish(worker_id);
-                    kfuncs::exit_sim_no_clear_ops();
-
-                    preempt::uninstall();
-                });
-            }
-
-            ring.start();
-            ring.wait_all_done();
-        });
-
-        debug!(
-            signal_preemptions = ring.signal_preemptions(),
-            cooperative_yields = ring.cooperative_yields(),
-            workers = cpu_ids.len(),
-            "batch-concurrent preemptive: complete"
-        );
-        preempt::uninstall_signal_handler();
     }
 
     /// Process CPUs kicked via `scx_bpf_kick_cpu` during a callback.

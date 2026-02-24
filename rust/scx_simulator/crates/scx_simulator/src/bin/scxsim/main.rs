@@ -207,6 +207,14 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     record_preemptions: Option<PathBuf>,
 
+    /// Replay preemption points from a recorded trace file.
+    ///
+    /// Reads a preemption trace (produced by --record-preemptions) and
+    /// replays the exact preemption points using a hybrid PMU + hardware
+    /// breakpoint approach for deterministic reproduction.
+    #[arg(long, value_name = "PATH", requires = "preemptive")]
+    replay_preemptions: Option<PathBuf>,
+
     /// Print detailed per-task and per-CPU statistics after simulation.
     ///
     /// By default, only a brief trace summary is printed. This flag
@@ -425,7 +433,7 @@ fn print_determinism_failure(
     }
 }
 
-fn run_simulation(cli: &Cli, scenario: scx_simulator::Scenario) -> Result<(), String> {
+fn run_simulation(cli: &Cli, mut scenario: scx_simulator::Scenario) -> Result<(), String> {
     let sched = load_scheduler(&cli.scheduler, cli.cpus)?;
     let _lock = SIM_LOCK.lock().unwrap();
 
@@ -433,6 +441,23 @@ fn run_simulation(cli: &Cli, scenario: scx_simulator::Scenario) -> Result<(), St
     // .so is unloaded when the Simulator is dropped, so scheduler_so_base()
     // must be called while the library is still mapped.
     let so_base = scheduler_so_base();
+
+    // Load replay trace if --replay-preemptions is set.
+    if let Some(ref path) = cli.replay_preemptions {
+        use std::io::BufReader;
+
+        let file = std::fs::File::open(path)
+            .map_err(|e| format!("--replay-preemptions: cannot open {}: {e}", path.display()))?;
+        let trace = PreemptionTrace::deserialize(&mut BufReader::new(file), so_base)
+            .map_err(|e| format!("--replay-preemptions: parse error: {e}"))?;
+        eprintln!(
+            "replay: loaded {} preemption points for {} workers from {}",
+            trace.len(),
+            trace.num_workers(),
+            path.display()
+        );
+        scenario.replay_trace = Some(trace);
+    }
 
     // Enable preemption recording if --record-preemptions is set.
     if cli.record_preemptions.is_some() {

@@ -29,6 +29,7 @@
 //! trace.dump();
 //! ```
 
+pub mod backend;
 pub mod bpf_trace;
 pub mod cgroup;
 pub mod cpu;
