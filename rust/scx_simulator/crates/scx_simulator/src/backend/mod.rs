@@ -9,6 +9,9 @@
 pub mod pmu;
 pub mod replay;
 
+#[cfg(feature = "frida")]
+pub mod frida;
+
 use std::collections::HashMap;
 
 use tracing::debug;

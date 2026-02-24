@@ -30,6 +30,17 @@ use crate::task::{OpsTaskState, Phase, SimTask, TaskState};
 use crate::trace::{DsqSampleTrigger, Trace, TraceKind};
 use crate::types::{CpuId, DsqId, KickFlags, Pid, TimeNs};
 
+/// Return a process-wide `Gum` handle, initializing on first call.
+///
+/// `Gum::obtain()` must only be called once per process — Stalker corrupts
+/// Frida's internal GLib thread state, so a second `Gum::obtain()` crashes.
+#[cfg(feature = "frida")]
+fn frida_gum() -> &'static frida_gum::Gum {
+    use std::sync::OnceLock;
+    static GUM: OnceLock<frida_gum::Gum> = OnceLock::new();
+    GUM.get_or_init(frida_gum::Gum::obtain)
+}
+
 /// Check for BPF errors after a scheduler callback.
 ///
 /// If `ignore` is false and a BPF error is pending, takes the error message
@@ -1064,7 +1075,14 @@ impl<S: Scheduler> Simulator<S> {
 
         // Log interleaving mode
         if let Some(ref cfg) = state.preemptive {
-            if !cfg.cooperative_only {
+            let mode = if cfg.use_frida {
+                "Frida Stalker software RBC"
+            } else if cfg.cooperative_only {
+                "cooperative-only (no PMU)"
+            } else {
+                "PMU RBC timer"
+            };
+            if !cfg.cooperative_only && !cfg.use_frida {
                 warn!(
                     timeslice_min = cfg.timeslice_min,
                     timeslice_max = cfg.timeslice_max,
@@ -1078,7 +1096,8 @@ impl<S: Scheduler> Simulator<S> {
                 timeslice_max = cfg.timeslice_max,
                 cooperative_only = cfg.cooperative_only,
                 break_on = %cfg.break_on,
-                "preemptive interleaving enabled (PMU {} timer)", cfg.break_on
+                mode,
+                "preemptive interleaving enabled"
             );
         } else if state.interleave {
             info!("cooperative interleaving enabled (kfunc boundaries only)");
@@ -2915,38 +2934,82 @@ impl<S: Scheduler> Simulator<S> {
 
         let interleave_seed = state.next_prng();
 
-        if let Some(ref preemptive_cfg) = state.preemptive {
-            if let Some(ref trace) = state.replay_trace {
-                let backend = ReplayBackend::new(trace, dispatch_cpus.len());
-                crate::backend::run_preemptive_dispatch(
-                    &dispatch_cpus,
-                    &state_send,
-                    &sched_send,
-                    interleave_seed,
-                    &backend,
-                );
+        // Choose the interleaving strategy for Phase 1.
+        //
+        // When the `frida` feature is compiled in and `use_frida` is set,
+        // use Frida Stalker software RBC instead of PMU hardware counters.
+        // This works in VMs/containers and provides exact branch counts
+        // with no PMU skid.
+        #[cfg(feature = "frida")]
+        let used_frida = if let Some(ref preemptive_cfg) = state.preemptive {
+            if preemptive_cfg.use_frida {
+                if let Some(range) = self.scheduler.text_range() {
+                    let gum = frida_gum();
+                    let text_range = crate::stalker::TextRange {
+                        base: range.0,
+                        size: range.1,
+                    };
+                    let backend = crate::backend::frida::FridaBackend::new(
+                        gum,
+                        &text_range,
+                        preemptive_cfg.timeslice_min,
+                        preemptive_cfg.timeslice_max,
+                    );
+                    crate::backend::run_preemptive_dispatch(
+                        &dispatch_cpus,
+                        &state_send,
+                        &sched_send,
+                        interleave_seed,
+                        &backend,
+                    );
+                    true
+                } else {
+                    false
+                }
             } else {
-                let backend = PmuBackend {
-                    timeslice_min: preemptive_cfg.timeslice_min,
-                    timeslice_max: preemptive_cfg.timeslice_max,
-                    cooperative_only: preemptive_cfg.cooperative_only,
-                    break_on: preemptive_cfg.break_on,
-                };
-                crate::backend::run_preemptive_dispatch(
-                    &dispatch_cpus,
-                    &state_send,
-                    &sched_send,
-                    interleave_seed,
-                    &backend,
-                );
+                false
             }
         } else {
-            self.dispatch_concurrent_cooperative(
-                &dispatch_cpus,
-                &state_send,
-                &sched_send,
-                interleave_seed,
-            );
+            false
+        };
+
+        #[cfg(not(feature = "frida"))]
+        let used_frida = false;
+
+        if !used_frida {
+            if let Some(ref preemptive_cfg) = state.preemptive {
+                if let Some(ref trace) = state.replay_trace {
+                    let backend = ReplayBackend::new(trace, dispatch_cpus.len());
+                    crate::backend::run_preemptive_dispatch(
+                        &dispatch_cpus,
+                        &state_send,
+                        &sched_send,
+                        interleave_seed,
+                        &backend,
+                    );
+                } else {
+                    let backend = PmuBackend {
+                        timeslice_min: preemptive_cfg.timeslice_min,
+                        timeslice_max: preemptive_cfg.timeslice_max,
+                        cooperative_only: preemptive_cfg.cooperative_only,
+                        break_on: preemptive_cfg.break_on,
+                    };
+                    crate::backend::run_preemptive_dispatch(
+                        &dispatch_cpus,
+                        &state_send,
+                        &sched_send,
+                        interleave_seed,
+                        &backend,
+                    );
+                }
+            } else {
+                self.dispatch_concurrent_cooperative(
+                    &dispatch_cpus,
+                    &state_send,
+                    &sched_send,
+                    interleave_seed,
+                );
+            }
         }
 
         // Phase 2: sequential post-processing on the engine thread.
@@ -3127,43 +3190,111 @@ impl<S: Scheduler> Simulator<S> {
         let cgroup_send = SendPtr(cgroup_registry as *mut CgroupRegistry);
 
         if let Some(ref preemptive_cfg) = state.preemptive.clone() {
-            if let Some(ref trace) = state.replay_trace {
-                let backend = ReplayBackend::new(trace, cpu_ids.len());
-                crate::backend::run_preemptive_batch(
-                    &per_cpu,
-                    &cpu_ids,
-                    &sim_send,
-                    &state_send,
-                    &tasks_send,
-                    &events_send,
-                    &cgroup_send,
-                    interleave_seed,
-                    watchdog_timeout,
-                    duration_ns,
-                    max_cgroups,
-                    &backend,
-                );
+            // When Frida is enabled, use Stalker software RBC instead of
+            // PMU hardware counters. This provides deterministic preemption
+            // without hardware PMU support.
+            //
+            // Optimization: skip Stalker when the batch contains only Tick
+            // events and the scheduler doesn't implement `tick`. In that
+            // case no scheduler `.so` code will execute, so Stalker DBI
+            // overhead is wasted (zero callouts). Fall back to cooperative
+            // interleaving which is sufficient since kfunc boundaries
+            // provide natural yield points.
+            #[cfg(feature = "frida")]
+            let used_frida = if preemptive_cfg.use_frida {
+                let all_ticks = per_cpu
+                    .values()
+                    .flat_map(|v| v.iter())
+                    .all(|e| matches!(e.kind, EventKind::Tick { .. }));
+                let skip_frida = all_ticks && !self.scheduler.has_tick();
+                if skip_frida {
+                    debug!(
+                        workers = cpu_ids.len(),
+                        "batch-concurrent frida: skipping (tick-only batch, scheduler has no tick)"
+                    );
+                    false
+                } else if let Some(range) = self.scheduler.text_range() {
+                    let gum = frida_gum();
+                    let text_range = crate::stalker::TextRange {
+                        base: range.0,
+                        size: range.1,
+                    };
+                    let backend = crate::backend::frida::FridaBackend::new(
+                        gum,
+                        &text_range,
+                        preemptive_cfg.timeslice_min,
+                        preemptive_cfg.timeslice_max,
+                    );
+                    crate::backend::run_preemptive_batch(
+                        &per_cpu,
+                        &cpu_ids,
+                        &sim_send,
+                        &state_send,
+                        &tasks_send,
+                        &events_send,
+                        &cgroup_send,
+                        interleave_seed,
+                        watchdog_timeout,
+                        duration_ns,
+                        max_cgroups,
+                        &backend,
+                    );
+                    true
+                } else {
+                    false
+                }
             } else {
-                let backend = PmuBackend {
-                    timeslice_min: preemptive_cfg.timeslice_min,
-                    timeslice_max: preemptive_cfg.timeslice_max,
-                    cooperative_only: preemptive_cfg.cooperative_only,
-                    break_on: preemptive_cfg.break_on,
-                };
-                crate::backend::run_preemptive_batch(
-                    &per_cpu,
-                    &cpu_ids,
-                    &sim_send,
-                    &state_send,
-                    &tasks_send,
-                    &events_send,
-                    &cgroup_send,
-                    interleave_seed,
-                    watchdog_timeout,
-                    duration_ns,
-                    max_cgroups,
-                    &backend,
-                );
+                false
+            };
+
+            #[cfg(not(feature = "frida"))]
+            let used_frida = false;
+
+            if !used_frida {
+                if let Some(ref trace) = state.replay_trace {
+                    let backend = ReplayBackend::new(trace, cpu_ids.len());
+                    crate::backend::run_preemptive_batch(
+                        &per_cpu,
+                        &cpu_ids,
+                        &sim_send,
+                        &state_send,
+                        &tasks_send,
+                        &events_send,
+                        &cgroup_send,
+                        interleave_seed,
+                        watchdog_timeout,
+                        duration_ns,
+                        max_cgroups,
+                        &backend,
+                    );
+                } else {
+                    let backend = PmuBackend {
+                        timeslice_min: preemptive_cfg.timeslice_min,
+                        timeslice_max: preemptive_cfg.timeslice_max,
+                        // Force cooperative-only for batch processing: PMU
+                        // signals introduce hardware-dependent skid. Batch
+                        // handlers already have cooperative yield points at
+                        // every kfunc boundary. PMU-based preemption is
+                        // reserved for dispatch_concurrent where the tight
+                        // C loop has no natural yield points.
+                        cooperative_only: true,
+                        break_on: preemptive_cfg.break_on,
+                    };
+                    crate::backend::run_preemptive_batch(
+                        &per_cpu,
+                        &cpu_ids,
+                        &sim_send,
+                        &state_send,
+                        &tasks_send,
+                        &events_send,
+                        &cgroup_send,
+                        interleave_seed,
+                        watchdog_timeout,
+                        duration_ns,
+                        max_cgroups,
+                        &backend,
+                    );
+                }
             }
         } else {
             Self::process_batch_concurrent_cooperative(
