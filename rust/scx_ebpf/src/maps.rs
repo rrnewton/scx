@@ -806,8 +806,8 @@ impl<V> TaskStorage<V> {
 
 // ── CgrpStorage ───────────────────────────────────────────────────────
 
-/// `BPF_MAP_TYPE_CGRP_STORAGE` = 34
-const MAP_TYPE_CGRP_STORAGE: usize = 34;
+/// `BPF_MAP_TYPE_CGRP_STORAGE` = 32
+const MAP_TYPE_CGRP_STORAGE: usize = 32;
 
 /// A BTF-compatible per-cgroup local storage map (`BPF_MAP_TYPE_CGRP_STORAGE`).
 ///
