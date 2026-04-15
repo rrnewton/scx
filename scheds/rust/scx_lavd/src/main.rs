@@ -1048,8 +1048,39 @@ fn main(mut opts: Opts) -> Result<()> {
 
     if let Some(nr_samples) = opts.monitor_sched_samples {
         let shutdown_copy = shutdown.clone();
+
+        // Recording gate: starts ON (backward compatible).
+        // SIGUSR1 → start recording, SIGUSR2 → stop recording.
+        let recording = Arc::new(AtomicBool::new(true));
+
+        let rec_on = recording.clone();
+        let rec_off = recording.clone();
+        unsafe {
+            signal_hook::low_level::register(signal_hook::consts::SIGUSR1, move || {
+                if !rec_on.swap(true, Ordering::Relaxed) {
+                    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+                    libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+                    let mono_ns = ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64;
+                    let msg = format!("# RECORDING_START {}\n", mono_ns);
+                    let _ = libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len());
+                }
+            })
+            .expect("failed to register SIGUSR1 handler");
+
+            signal_hook::low_level::register(signal_hook::consts::SIGUSR2, move || {
+                if rec_off.swap(false, Ordering::Relaxed) {
+                    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+                    libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+                    let mono_ns = ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64;
+                    let msg = format!("# RECORDING_STOP {}\n", mono_ns);
+                    let _ = libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len());
+                }
+            })
+            .expect("failed to register SIGUSR2 handler");
+        }
+
         let jh = std::thread::spawn(move || {
-            stats::monitor_sched_samples(nr_samples, shutdown_copy).unwrap()
+            stats::monitor_sched_samples(nr_samples, shutdown_copy, recording).unwrap()
         });
         let _ = jh.join();
         return Ok(());

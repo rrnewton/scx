@@ -412,7 +412,11 @@ pub fn server_data(nr_cpus_onln: u64) -> StatsServerData<StatsReq, StatsRes> {
         )
 }
 
-pub fn monitor_sched_samples(nr_samples: u64, shutdown: Arc<AtomicBool>) -> Result<()> {
+pub fn monitor_sched_samples(
+    nr_samples: u64,
+    shutdown: Arc<AtomicBool>,
+    recording: Arc<AtomicBool>,
+) -> Result<()> {
     scx_utils::monitor_stats::<SchedSamples>(
         &vec![
             ("target".into(), "sched_samples".into()),
@@ -421,8 +425,17 @@ pub fn monitor_sched_samples(nr_samples: u64, shutdown: Arc<AtomicBool>) -> Resu
         Duration::from_secs(0),
         || shutdown.load(Ordering::Relaxed),
         |ts| {
+            if !recording.load(Ordering::Relaxed) {
+                return Ok(());
+            }
             let mut stdout = std::io::stdout();
+            let mono_ns = {
+                let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+                unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+                ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+            };
             for sample in ts.samples.iter() {
+                write!(stdout, "T={} ", mono_ns)?;
                 sample.format(&mut stdout)?;
             }
             Ok(())
