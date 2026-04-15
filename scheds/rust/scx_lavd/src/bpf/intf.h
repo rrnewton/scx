@@ -115,6 +115,7 @@ struct task_ctx_x {
 	u64	dsq_id;		/* CPU's associated DSQ */
 	u64	dsq_consume_lat; /* DSQ's consume latency */
 	u64	last_slice_used_wall;	/* time(ns) used in last scheduled interval: [last running, last stopping] */
+	u64	timestamp_ns;		/* BPF ktime timestamp when this sample was captured */
 };
 
 

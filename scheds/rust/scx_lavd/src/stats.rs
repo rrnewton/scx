@@ -200,13 +200,15 @@ pub struct SchedSample {
     pub dsq_id: u64,
     #[stat(desc = "Consume latency of this DSQ (shows how contended the DSQ is)")]
     pub dsq_consume_lat: u64,
+    #[stat(desc = "BPF ktime timestamp (ns) when this sample was captured")]
+    pub timestamp_ns: u64,
 }
 
 impl SchedSample {
     pub fn format_header<W: Write>(w: &mut W) -> Result<()> {
         writeln!(
             w,
-            "\x1b[93m| {:6} | {:7} | {:17} | {:5} | {:4} | {:8} | {:8} | {:8} | {:17} | {:8} | {:11} | {:8} | {:7} | {:8} | {:12} | {:12} | {:9} | {:9} | {:9} | {:9} | {:8} | {:8} | {:8} | {:8} | {:9} | {:10} | {:11} | {:9} | {:10} | {:6} | {:6} | {:10} |\x1b[0m",
+            "\x1b[93m| {:6} | {:7} | {:17} | {:5} | {:4} | {:8} | {:8} | {:8} | {:17} | {:8} | {:11} | {:8} | {:7} | {:8} | {:12} | {:12} | {:9} | {:9} | {:9} | {:9} | {:8} | {:8} | {:8} | {:8} | {:9} | {:10} | {:11} | {:9} | {:10} | {:6} | {:6} | {:10} | {:>18} |\x1b[0m",
             "MSEQ",
             "PID",
             "COMM",
@@ -239,6 +241,7 @@ impl SchedSample {
             "NR_ACT",
             "DSQ_ID",
             "DSQ_LAT_NS",
+            "TIMESTAMP_NS",
         )?;
         Ok(())
     }
@@ -250,7 +253,7 @@ impl SchedSample {
 
         writeln!(
             w,
-            "| {:6} | {:7} | {:17} | {:5} | {:4} | {:8} | {:8} | {:8} | {:17} | {:8} | {:11} | {:8} | {:7} | {:8} | {:12} | {:12} | {:9} | {:9} | {:9} | {:9} | {:8} | {:8} | {:8} | {:8} | {:9} | {:10} | {:11} | {:9} | {:10} | {:6} | {:6} | {:10} |",
+            "| {:6} | {:7} | {:17} | {:5} | {:4} | {:8} | {:8} | {:8} | {:17} | {:8} | {:11} | {:8} | {:7} | {:8} | {:12} | {:12} | {:9} | {:9} | {:9} | {:9} | {:8} | {:8} | {:8} | {:8} | {:9} | {:10} | {:11} | {:9} | {:10} | {:6} | {:6} | {:10} | {:>18} |",
             self.mseq,
             self.pid,
             self.comm,
@@ -283,6 +286,7 @@ impl SchedSample {
             self.nr_active,
             self.dsq_id,
             self.dsq_consume_lat,
+            self.timestamp_ns,
         )?;
         Ok(())
     }

@@ -87,6 +87,7 @@ int submit_task_ctx(struct task_struct *p, task_ctx __arg_arena *taskc, u32 cpu_
 	m->taskc_x.dsq_id = cpdomc->id;
 	m->taskc_x.dsq_consume_lat = cpdomc->dsq_consume_lat;
 	m->taskc_x.last_slice_used_wall = taskc->last_slice_used_wall;
+	m->taskc_x.timestamp_ns = bpf_ktime_get_ns();
 
 	bpf_ringbuf_submit(m, 0);
 
