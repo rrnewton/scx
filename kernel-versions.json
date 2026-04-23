@@ -30,5 +30,13 @@
     "lastModified": 1771563608,
     "narHash": "sha256-cYHIA+gUbf/liKbnjvMyOZWg5tcJtES/xM2Oc4OnhGw=",
     "kernelVersion": "6.18.13"
+  },
+  "stable/7_0": {
+    "repo": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git",
+    "branch": "linux-7.0.y",
+    "commitHash": "3cb1fb7a56d2fd8011f5282bc170c0d23dc1f4b5",
+    "lastModified": 1745395200,
+    "narHash": "sha256-fuTABH0d2w6r1qO7gX1UOZVvBCwQGqa2U4G2ZB4vKBo=",
+    "kernelVersion": "7.0.1"
   }
 }
