@@ -2238,6 +2238,13 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_cgroup_init, struct cgroup *cgrp,
 	if (!enable_cpu_bw)
 		return 0;
 
+	if (args->bw_quota_us != ((u64)~0ULL)) {
+		scx_bpf_error("--enable-cpu-bw cannot be combined with finite kernel cpu.max: cgid=%llu quota_us=%llu period_us=%llu burst_us=%llu; set cpu.max to max or omit --enable-cpu-bw",
+			      cgrp->kn->id, args->bw_quota_us,
+			      args->bw_period_us, args->bw_burst_us);
+		return -EOPNOTSUPP;
+	}
+
 	ret = scx_cgroup_bw_init(cgrp, args);
 	if (ret)
 	       scx_bpf_error("Failed to init a cgroup: %d", ret);
@@ -2283,6 +2290,12 @@ void BPF_STRUCT_OPS(lavd_cgroup_set_bandwidth, struct cgroup *cgrp,
 
 	if (!enable_cpu_bw)
 		return;
+
+	if (quota_us != ((u64)~0ULL)) {
+		scx_bpf_error("--enable-cpu-bw cannot be combined with finite kernel cpu.max: cgid=%llu quota_us=%llu period_us=%llu burst_us=%llu; set cpu.max to max or omit --enable-cpu-bw",
+			      cgrp->kn->id, quota_us, period_us, burst_us);
+		return;
+	}
 
 	ret = scx_cgroup_bw_set(cgrp, period_us, quota_us, burst_us);
 	if (ret)

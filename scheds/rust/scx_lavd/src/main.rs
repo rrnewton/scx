@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::thread::ThreadId;
 use std::time::Duration;
 
+use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
@@ -64,6 +65,9 @@ use stats::SchedSamples;
 use stats::StatsReq;
 use stats::StatsRes;
 use stats::SysStats;
+use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
 use tracing::{debug, info, warn};
 use tracing_subscriber::filter::EnvFilter;
 
@@ -1019,6 +1023,37 @@ fn init_log(opts: &Opts) {
     }
 }
 
+fn reject_finite_cpu_max_cgroups() -> Result<()> {
+    let cgroup_root = Path::new("/sys/fs/cgroup");
+    let mut stack = vec![PathBuf::from(cgroup_root)];
+
+    while let Some(dir) = stack.pop() {
+        let cpu_max = dir.join("cpu.max");
+        if let Ok(contents) = fs::read_to_string(&cpu_max) {
+            let quota = contents.split_whitespace().next().unwrap_or("max");
+            if quota != "max" {
+                bail!(
+                    "--enable-cpu-bw cannot be combined with finite kernel cpu.max: {} contains {:?}; set cpu.max to max or omit --enable-cpu-bw",
+                    cpu_max.display(),
+                    contents.trim()
+                );
+            }
+        }
+
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                stack.push(entry.path());
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[clap_main::clap_main]
 fn main(mut opts: Opts) -> Result<()> {
     if opts.version {
@@ -1080,6 +1115,10 @@ fn main(mut opts: Opts) -> Result<()> {
             let _ = jh.join();
             return Ok(());
         }
+    }
+
+    if opts.enable_cpu_bw {
+        reject_finite_cpu_max_cgroups()?;
     }
 
     let mut open_object = MaybeUninit::uninit();
