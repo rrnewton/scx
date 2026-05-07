@@ -1675,7 +1675,7 @@ bool cbw_has_backlogged_tasks(struct scx_cgroup_ctx *cgx)
 static
 bool cbw_replenish_cgroup(struct scx_cgroup_ctx *cgx, u64 now)
 {
-	s64 burst_credit = 0, debt = 0, budget;
+	s64 burst_credit = 0, debt = 0, debt_base = 0, raw_budget, budget;
 	bool period_end, was_throttled, keep_throttled = false;
 
 	/*
@@ -1703,6 +1703,11 @@ bool cbw_replenish_cgroup(struct scx_cgroup_ctx *cgx, u64 now)
 	 * the just-completed interval). Using period_budget rather than bare
 	 * nquota_ub is correct: if burst was granted last interval, spending
 	 * up to period_budget is not a violation and should not incur debt.
+	 * If period_budget was non-positive, however, the cgroup was already
+	 * kept throttled for debt repayment. Charging runtime_total_last
+	 * against a negative budget would recreate old debt even if the cgroup
+	 * did not run, leaving SCX-visible BTQ tasks unrunnable long enough for
+	 * the runnable-task watchdog to fire.
 	 *
 	 * Burst credit: underspend relative to nquota (the cgroup's own
 	 * quota), clamped to [0, burst_remaining], matching cpu.max.burst
@@ -1716,7 +1721,8 @@ bool cbw_replenish_cgroup(struct scx_cgroup_ctx *cgx, u64 now)
 	 * also 0, so clamp(..., 0LL, 0LL) = 0 and burst_credit is always
 	 * zero without any special casing.
 	 */
-	debt = max(cgx->runtime_total_last - cgx->period_budget, 0LL);
+	debt_base = max(cgx->period_budget, 0LL);
+	debt = max(cgx->runtime_total_last - debt_base, 0LL);
 	burst_credit = clamp((s64)cgx->nquota - cgx->runtime_total_last,
 			     0LL, cgx->burst_remaining);
 
@@ -1733,17 +1739,18 @@ bool cbw_replenish_cgroup(struct scx_cgroup_ctx *cgx, u64 now)
 		WRITE_ONCE(cgx->burst_remaining,
 			   cgx->burst_remaining - burst_credit);
 
-	budget = (s64)cgx->nquota_ub + burst_credit - debt;
+	raw_budget = (s64)cgx->nquota_ub + burst_credit - debt;
+	budget = max(raw_budget, 0LL);
 	WRITE_ONCE(cgx->period_budget, budget);
 
 	/*
-	 * If budget <= 0, the cgroup's debt exceeds its quota and burst for
+	 * If raw_budget <= 0, the cgroup's debt exceeds its quota and burst for
 	 * this period, so it has no CPU time to spend. Keep it throttled so
 	 * that (a) the bottom half does not drain its BTQ and (b) the caller
 	 * can propagate the throttle to descendants immediately via
 	 * cbw_throttle_cgroups() without waiting for the next accounting tick.
 	 */
-	keep_throttled = (budget <= 0);
+	keep_throttled = (raw_budget <= 0);
 
 	/*
 	 * Update the EWMA consumption rate (CBW_SCALE = 1024 means 100% of
