@@ -817,8 +817,8 @@ void cbw_set_bandwidth(struct cgroup *cgrp, struct scx_cgroup_ctx *cgx,
 		cgx->burst = 0;
 	} else {
 		cgx->quota = quota_us * 1000;
-		cgx->nquota = div_round_up(quota_us * CBW_REPLENISH_PERIOD,
-					   period_us);
+		cgx->nquota = 2 * div_round_up(quota_us * CBW_REPLENISH_PERIOD,
+					       period_us);
 		cgx->burst = burst_us * 1000;
 	}
 	cgx->burst_remaining = cgx->burst;
