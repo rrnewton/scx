@@ -2178,14 +2178,23 @@ int cbw_reenqueue_cgroup(struct cgroup *cgrp, struct scx_cgroup_ctx *cgx,
 	 * Note that we start with a random LLC to give each LLC a fair
 	 * chance to be reenqueued.
 	 */
-	if (!cgx->has_llcx)
+	if (!cgx->has_llcx) {
+		cbw_pr11("reenqueue_cgroup: ABORT cgid=%llu has_llcx=false (returns 0 — STALL CANDIDATE)",
+			 cgrp_id);
 		return false;
+	}
+	cbw_pr11("reenqueue_cgroup: ENTER cgid=%llu TOPO_NR(LLC)=%d",
+		 cgrp_id, (int)TOPO_NR(LLC));
 	cbw_dbg("cgid%llu", cgrp_id);
 
 	bpf_for(i, 0, TOPO_NR(LLC)) {
+		cbw_pr11("reenqueue_cgroup: LOOP_BODY cgid=%llu i=%d (bpf_for iter)",
+			 cgrp_id, i);
 		idx = (nuance + i) % TOPO_NR(LLC);
 		llcx = cbw_get_llc_ctx_with_id(cgrp_id, idx);
 		if (!llcx) {
+			cbw_pr11("reenqueue_cgroup: NO_LLCX cgid=%llu llc=%d (skipping LLC)",
+				 cgrp_id, idx);
 			cbw_err("Failed to lookup an LLC context: cgid%llu", cgrp_id);
 			continue;
 		}
@@ -2193,11 +2202,26 @@ int cbw_reenqueue_cgroup(struct cgroup *cgrp, struct scx_cgroup_ctx *cgx,
 		/*
 		 * If the cgroup is throttled, all its LLC contexts are
 		 * throttled too. Stop draining immediately.
+		 *
+		 * PRONG 11 probe: print when this break path is hit.
+		 * Hypothesis (4) — IF this fires every reenqueue invocation
+		 * during the silent-window before stall, THEN the bug is
+		 * "reenqueue refuses to drain BTQ while cgroup is throttled,
+		 * so tasks stuck in BTQ are invisible to scx core watchdog".
 		 */
-		if (cbw_cgroup_bw_throttled(cgrp) == -EAGAIN)
+		if (cbw_cgroup_bw_throttled(cgrp) == -EAGAIN) {
+			cbw_pr11("reenqueue_cgroup: BREAK throttled — NOT draining BTQ for cgid=%llu (Hyp4 confirm)",
+				 cgrp_id);
 			break;
+		}
 
-		nr_enq += cbw_drain_btq_batch(cgx, llcx);
+		{
+			int _drained = cbw_drain_btq_batch(cgx, llcx);
+			nr_enq += _drained;
+			cbw_pr11("reenqueue_cgroup: DRAIN cgid=%llu llc=%d drained=%d",
+				 cgrp_id, idx, _drained);
+		}
+		(void)0; /* keep nr_enq scoping consistent */
 		if (nr_enq >= CBW_REENQ_MAX_BATCH)
 			break;
 	}
@@ -2249,12 +2273,32 @@ int scx_cgroup_bw_reenqueue(void)
 	bool root_added = false;
 
 	/*
+	 * PRONG 11 disambiguation printk: rate-limited at the function
+	 * entry so we can prove "lavd_dispatch IS calling reenqueue"
+	 * even when the early-out fast path returns 0. Distinguishes
+	 * Hypothesis (3) "dispatch never called" from (1)/(2).
+	 */
+	cbw_pr11_rl("reenqueue called (entry)");
+
+	/*
 	 * If there are throttled tasks in BTQ, let’s reenqueue them.
 	 */
-	if (likely(!cbw_has_throttled_tasks(&backlog_stat)))
+	if (likely(!cbw_has_throttled_tasks(&backlog_stat))) {
+		/*
+		 * PRONG 11: rate-limited probe of the no-tasks early-out.
+		 * This is hit on every dispatch when the BTQ flag is clear.
+		 * If we see THIS but never the "backlog detected" line below
+		 * during the stall window, Hypothesis (1) is confirmed:
+		 * the cgroup never marks itself unthrottled, but ALSO no
+		 * task ever shows up via cbw_has_throttled_tasks's view —
+		 * so reenqueue legitimately does nothing while tasks rot
+		 * in the BTQ. Tagged "noenq" to grep separately.
+		 */
+		cbw_pr11_rl("reenqueue noenq: cbw_has_throttled_tasks=false (early return 0)");
 		return 0;
+	}
 
-	cbw_pr11("reenqueue: nr_throttled_cgroups=%llu — backlog detected, draining BTQs",
+	cbw_pr11("reenqueue: cbw_has_throttled_tasks=TRUE nr_throttled_cgroups=%llu",
 		 backlog_stat.nr_throttled_cgroups);
 
 	/*
@@ -2284,8 +2328,11 @@ int scx_cgroup_bw_reenqueue(void)
 		 * there are no backlogged tasks on that cgroup. So skip it.
 		 */
 		cur_cgrp_id = READ_ONCE(ids[0]);
-		if (cur_cgrp_id == 0)
+		if (cur_cgrp_id == 0) {
+			cbw_pr11("reenqueue outer: SKIP idx=%d cgid=0 (slot purged) — but has_throttled_tasks said TRUE",
+				 idx);
 			continue;
+		}
 
 		cur_cgrp = bpf_cgroup_from_id(cur_cgrp_id);
 		if (!cur_cgrp) {
@@ -2337,7 +2384,11 @@ int scx_cgroup_bw_reenqueue(void)
 		}
 
 		/* Reqneueue backlogged tasks. */
+		cbw_pr11("reenqueue outer: CALL cbw_reenqueue_cgroup cgid=%llu",
+			 cur_cgrp_id);
 		n = cbw_reenqueue_cgroup(cur_cgrp, cur_cgx, cur_cgrp_id, nuance2);
+		cbw_pr11("reenqueue outer: RET cbw_reenqueue_cgroup cgid=%llu n=%d",
+			 cur_cgrp_id, n);
 		bpf_cgroup_release(cur_cgrp);
 
 		/*
