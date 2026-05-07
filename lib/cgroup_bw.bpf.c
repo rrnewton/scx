@@ -2131,6 +2131,17 @@ int cbw_drain_btq_batch(struct scx_cgroup_ctx *cgx,
 	scx_task_common *taskc;
 	scx_atq_t *btq;
 	int i;
+	int btq_n;
+	u64 pop_result;
+
+	/*
+	 * PR11 v1.7: Entry probe — confirm we got into the function at all.
+	 * Print initial llcx->btq pointer + nr_queued (snapshot — may race).
+	 */
+	btq = READ_ONCE(llcx->btq);
+	btq_n = btq ? scx_atq_nr_queued(btq) : -1;
+	cbw_pr11("drain_batch: ENTRY cgid=%llu btq=%p nr_queued_snap=%d",
+		 cgx->id, btq, btq_n);
 
 	/*
 	 * Pop the tasks in the BTQ and ask the BPF scheduler to enqueue
@@ -2147,20 +2158,33 @@ int cbw_drain_btq_batch(struct scx_cgroup_ctx *cgx,
 	 * this field before destroying the ATQ; catching NULL between
 	 * iterations prevents operating on a freed ATQ.
 	 */
-	for (i = 0; i < CBW_REENQ_MAX_BATCH &&
-		    (btq = READ_ONCE(llcx->btq)) &&
-		    (taskc = (scx_task_common *)scx_atq_pop(btq)) &&
-		    can_loop; i++) {
+	for (i = 0; i < CBW_REENQ_MAX_BATCH && can_loop; i++) {
+		btq = READ_ONCE(llcx->btq);
+		if (!btq) {
+			cbw_pr11("drain_batch: BTQ_NULL cgid=%llu i=%d (llcx->btq became NULL)",
+				 cgx->id, i);
+			break;
+		}
+		pop_result = scx_atq_pop(btq);
+		if (!pop_result) {
+			cbw_pr11("drain_batch: POP_NULL cgid=%llu i=%d btq=%p nr_queued=%d (BTQ empty or lock fail — Hyp5 confirm if non-zero nr_queued)",
+				 cgx->id, i, btq, scx_atq_nr_queued(btq));
+			break;
+		}
+		taskc = (scx_task_common *)pop_result;
+		cbw_pr11("drain_batch: POP_OK cgid=%llu i=%d taskc=%p — calling enqueue_cb",
+			 cgx->id, i, taskc);
 		/*
 		 * Note that we do not worry about racing with .dequeue() here,
 		 * because even if we do, the callback's insert_vtime call will
-		 * fail silently in the scx core. 
+		 * fail silently in the scx core.
 		 */
 
 		scx_cgroup_bw_enqueue_cb((u64)taskc);
 		cbw_dbg("cgid%llu", cgx->id);
 	}
 
+	cbw_pr11("drain_batch: EXIT  cgid=%llu drained=%d", cgx->id, i);
 	return i;
 }
 
