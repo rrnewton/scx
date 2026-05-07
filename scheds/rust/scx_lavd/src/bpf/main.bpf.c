@@ -241,6 +241,8 @@ const volatile u64	lb_local_dsq_util_wall = 0;
 const volatile u64	pinned_slice_ns = 0;
 
 static volatile u64	nr_cpus_big;
+static volatile u64	nr_md_local_retarget;
+static volatile u64	nr_md_local_same_cpu;
 
 /*
  * Scheduler's PID
@@ -615,6 +617,34 @@ static bool can_direct_dispatch(struct cpu_ctx *cpuc, bool is_cpu_idle)
 		cpuc->avg_util_wall < lb_local_dsq_util_wall);
 }
 
+#define LAVD_MD_GUARD_SELECT_CPU	1
+#define LAVD_MD_GUARD_ENQUEUE		2
+
+static __always_inline bool
+retarget_migration_disabled_local(struct task_struct *p, s32 *cpu,
+				  bool *is_idle, u32 path)
+{
+	s32 task_cpu;
+	u64 n;
+
+	if (!is_migration_disabled(p))
+		return false;
+
+	task_cpu = scx_bpf_task_cpu(p);
+	if (*cpu == task_cpu) {
+		__sync_fetch_and_add(&nr_md_local_same_cpu, 1);
+		return false;
+	}
+
+	n = __sync_fetch_and_add(&nr_md_local_retarget, 1) + 1;
+	bpf_printk("[PR15-LAVD md_guard=retarget path=%u n=%llu pid=%d comm=%s selected_cpu=%d task_cpu=%d",
+		   path, n, p->pid, p->comm, *cpu, task_cpu);
+
+	*cpu = task_cpu;
+	*is_idle = false;
+	return true;
+}
+
 s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
@@ -669,6 +699,8 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 	 */
 	cpu_id = pick_idle_cpu(&ictx, &found_idle);
 	cpu_id = cpu_id >= 0 ? cpu_id : prev_cpu;
+	retarget_migration_disabled_local(p, &cpu_id, &found_idle,
+					  LAVD_MD_GUARD_SELECT_CPU);
 	ictx.taskc->suggested_cpu_id = cpu_id;
 
 	if (found_idle) {
@@ -687,6 +719,12 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 		}
 
 		if (can_direct_dispatch(cpuc, true)) {
+			if (retarget_migration_disabled_local(p, &cpu_id,
+							      &found_idle,
+							      LAVD_MD_GUARD_SELECT_CPU)) {
+				ictx.taskc->suggested_cpu_id = cpu_id;
+				goto out;
+			}
 			p->scx.dsq_vtime = calc_when_to_run(p, ictx.taskc);
 			p->scx.slice = LAVD_SLICE_MAX_NS_DFL;
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, p->scx.slice, 0);
@@ -793,6 +831,8 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		is_idle = test_task_flag(taskc, LAVD_FLAG_IDLE_CPU_PICKED);
 		reset_task_flag(taskc, LAVD_FLAG_IDLE_CPU_PICKED);
 	}
+	retarget_migration_disabled_local(p, &cpu, &is_idle,
+					  LAVD_MD_GUARD_ENQUEUE);
 
 	cpuc = get_cpu_ctx_id(cpu);
 	if (!cpuc) {
@@ -847,6 +887,16 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	 * to enable vtime comparison across DSQs during dispatch.
 	 */
 	if (can_direct_dispatch(cpuc, is_idle)) {
+		if (retarget_migration_disabled_local(p, &cpu, &is_idle,
+						      LAVD_MD_GUARD_ENQUEUE)) {
+			cpuc = get_cpu_ctx_id(cpu);
+			if (!cpuc) {
+				scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
+				return;
+			}
+			taskc->suggested_cpu_id = cpu;
+			taskc->cpdom_id = cpuc->cpdom_id;
+		}
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, p->scx.slice,
 				   enq_flags);
 	} else {
