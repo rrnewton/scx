@@ -689,7 +689,7 @@ impl<'a> Scheduler<'a> {
         rodata.no_wake_sync = opts.no_wake_sync;
         rodata.no_slice_boost = opts.no_slice_boost;
         rodata.per_cpu_dsq = opts.per_cpu_dsq;
-        rodata.enable_cpu_bw = opts.enable_cpu_bw;
+        rodata.enable_cpu_bw = false;
 
         if !ksym_exists("scx_group_set_bandwidth").unwrap() {
             skel.struct_ops.lavd_ops_mut().cgroup_set_bandwidth = std::ptr::null_mut();
