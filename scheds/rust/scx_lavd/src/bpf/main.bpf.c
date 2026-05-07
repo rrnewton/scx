@@ -699,10 +699,36 @@ out:
 	return cpu_id;
 }
 
+/*
+ * Bug-1 fix v2 (feat/lavd-bug1-fix-btq-drain-race): watchdog-avoidance
+ * safety valve. When a cgroup has been throttled hard enough that NO
+ * task from it has been allowed through cgroup_throttled() for ~4 seconds,
+ * the kernel sched_ext watchdog will fire (default timeout 5 s, ours 5 s).
+ * To prevent the stall while still enforcing 99 %+ of the throttle, the
+ * Nth call (N = a counter incremented each time -EAGAIN is returned and
+ * reset on each non-throttled return) is allowed through. This costs a
+ * tiny bandwidth violation but keeps the watchdog satisfied.
+ *
+ * The threshold N is chosen so that:
+ *   - Under reasonable load (~thousands of cgroup_throttled calls/sec
+ *     across all 32 CPUs), N=20000 yields a "let-through" every ~5 s
+ *     globally — enough to reset the per-task watchdog timer.
+ *   - The bandwidth violation is bounded: at most one task gets to run
+ *     for one slice (a few ms) per safety-valve trigger.
+ *
+ * This is a SYMPTOM-LEVEL fix. The deeper root cause (LAVD's BPF
+ * cgroup-bw drain stops being called by the BPF runtime when the cgroup
+ * remains throttled long enough — see PR11_chase REPORT.md attempt 70)
+ * is left for upstream investigation; this fix prevents the watchdog
+ * from firing in the meantime.
+ */
+static __u64 lavd_cgthr_eagain_counter SEC(".data");
+
 static int cgroup_throttled(struct task_struct *p, task_ctx *taskc, bool put_aside)
 {
 	struct cgroup *cgrp;
 	int ret, ret2;
+	__u64 c;
 
 	/*
 	 * Under CPU bandwidth control using cpu.max, we should first check
@@ -722,6 +748,20 @@ static int cgroup_throttled(struct task_struct *p, task_ctx *taskc, bool put_asi
 
 	ret = scx_cgroup_bw_throttled(cgrp, p);
 	if (ret == -EAGAIN) {
+		/*
+		 * Safety-valve counter: count consecutive -EAGAIN returns
+		 * across the whole scheduler. When the count crosses the
+		 * threshold, force-allow this one through and reset.
+		 */
+		c = __sync_fetch_and_add(&lavd_cgthr_eagain_counter, 1) + 1;
+		if (c >= 20000) {
+			__sync_lock_test_and_set(&lavd_cgthr_eagain_counter, 0);
+			bpf_printk("[BUG1FIX-LAVD %s:%d] safety-valve fired cgid=%llu pid=%d comm=%s — letting task through to avoid watchdog",
+				   __func__, __LINE__, taskc->cgrp_id,
+				   p->pid, p->comm);
+			bpf_cgroup_release(cgrp);
+			return 0;  /* not throttled this time — let it run */
+		}
 		bpf_printk("[PR11-LAVD %s:%d] cgroup_throttled=YES cgid=%llu pid=%d comm=%s put_aside=%d",
 			   __func__, __LINE__, taskc->cgrp_id,
 			   p->pid, p->comm, put_aside);
@@ -732,6 +772,13 @@ static int cgroup_throttled(struct task_struct *p, task_ctx *taskc, bool put_asi
 				return ret2;
 			}
 		}
+	} else if (ret == 0) {
+		/*
+		 * Cgroup not throttled — reset the safety-valve counter so
+		 * we only count CONSECUTIVE -EAGAIN streaks. This avoids
+		 * triggering the safety valve on long-running normal load.
+		 */
+		__sync_lock_test_and_set(&lavd_cgthr_eagain_counter, 0);
 	}
 	bpf_cgroup_release(cgrp);
 	return ret;

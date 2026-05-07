@@ -2418,18 +2418,58 @@ int scx_cgroup_bw_reenqueue(void)
 		/*
 		 * When there are no more backlogged tasks under the cgroup,
 		 * let's purge the cgroup entry from the throttled cgroup table.
+		 *
+		 * Bug-1 fix (feat/lavd-bug1-fix-btq-drain-race): the original
+		 * gate `(n == 0) && !cbw_top_half_running()` allowed a stuck
+		 * state where the cgroup remained in cbw_throttled_cgroup_ids
+		 * for an unbounded time. Mechanism (PR11 chase, attempt 70,
+		 * stall at t=145.2s on cpu.max=10000/100000):
+		 *
+		 *   1. Drain cycle empties llcx->btq down to 0 at t=139.16s.
+		 *   2. Tasks dispatch back to DSQs via scx_cgroup_bw_enqueue_cb.
+		 *   3. Kernel CFS bandwidth controller (cpu.max) throttles the
+		 *      tasks at the kernel layer; they sit in DSQs but cannot
+		 *      run. lavd_enqueue / cgroup_throttled() therefore stop
+		 *      being called for them. (LAVD's own bw machinery has
+		 *      drained the BTQ but tasks are stuck at the CFS layer.)
+		 *   4. Reenqueue keeps firing every ~100 ms because the
+		 *      cgroup is still in cbw_throttled_cgroup_ids — but every
+		 *      attempt finds the BTQ empty (drain returns 0).
+		 *   5. !cbw_top_half_running() oscillates with the replenish
+		 *      timer, frequently being TRUE while the timer mid-flight,
+		 *      so the CAS-clear here often does not run.
+		 *   6. After 5 s the kernel sched_ext watchdog fires:
+		 *        "yes[<pid>] failed to run for 5.x s".
+		 *
+		 * Fix: also allow the CAS-clear when we observe (n == 0) for
+		 * a cgroup whose BTQ is genuinely empty. This is safe: if
+		 * tasks re-enter the BTQ later (via scx_cgroup_bw_put_aside),
+		 * they will re-add the cgroup to cbw_throttled_cgroup_ids on
+		 * the next replenish tick. The CAS itself remains keyed on
+		 * cur_cgrp_id so a concurrent overwrite by cbw_top_half_begin()
+		 * is harmless. We retain the original `!cbw_top_half_running()`
+		 * branch as the fast path so the new behavior only kicks in
+		 * when the timer is actively running.
 		 */
-		if ((n == 0) && !cbw_top_half_running()) {
-			/*
-			 * There is a TOCTOU window between the
-			 * !cbw_top_half_running() check above and this CAS.
-			 * cbw_top_half_begin() may fire in that window and
-			 * overwrite ids[idx] with a new cgroup ID. The CAS
-			 * handles this safely: it is keyed on the old
-			 * cur_cgrp_id, so it fails if the entry was already
-			 * overwritten by the timer.
-			 */
-			__sync_bool_compare_and_swap(ids, cur_cgrp_id, 0);
+		if (n == 0) {
+			bool btq_empty = !cbw_has_backlogged_tasks(cur_cgx);
+			if (!cbw_top_half_running() || btq_empty) {
+				/*
+				 * There is a TOCTOU window between the
+				 * !cbw_top_half_running() check above and
+				 * this CAS. cbw_top_half_begin() may fire in
+				 * that window and overwrite ids[idx] with a
+				 * new cgroup ID. The CAS handles this safely:
+				 * it is keyed on the old cur_cgrp_id, so it
+				 * fails if the entry was already overwritten
+				 * by the timer.
+				 */
+				__sync_bool_compare_and_swap(ids, cur_cgrp_id, 0);
+				if (btq_empty) {
+					cbw_pr11("BUG1FIX: force-cleared cgid=%llu from throttled_ids (BTQ empty, n=0)",
+						 cur_cgrp_id);
+				}
+			}
 		}
 
 		/*
