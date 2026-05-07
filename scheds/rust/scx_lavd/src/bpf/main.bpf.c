@@ -721,11 +721,16 @@ static int cgroup_throttled(struct task_struct *p, task_ctx *taskc, bool put_asi
 	}
 
 	ret = scx_cgroup_bw_throttled(cgrp, p);
-	if ((ret == -EAGAIN) && put_aside) {
-		ret2 = scx_cgroup_bw_put_aside(p, (u64)taskc, p->scx.dsq_vtime, cgrp);
-		if (ret2) {
-			bpf_cgroup_release(cgrp);
-			return ret2;
+	if (ret == -EAGAIN) {
+		bpf_printk("[PR11-LAVD %s:%d] cgroup_throttled=YES cgid=%llu pid=%d comm=%s put_aside=%d",
+			   __func__, __LINE__, taskc->cgrp_id,
+			   p->pid, p->comm, put_aside);
+		if (put_aside) {
+			ret2 = scx_cgroup_bw_put_aside(p, (u64)taskc, p->scx.dsq_vtime, cgrp);
+			if (ret2) {
+				bpf_cgroup_release(cgrp);
+				return ret2;
+			}
 		}
 	}
 	bpf_cgroup_release(cgrp);

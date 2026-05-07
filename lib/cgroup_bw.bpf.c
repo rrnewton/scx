@@ -437,6 +437,31 @@ void cbw_top_half_end(u16 nr_throttled_cgroups, u16 has_throttled_tasks)
 			   cgrp->kn->id, ##__VA_ARGS__);			\
 } while(0)
 
+/*
+ * PRONG 11 — unconditional debug printks for the LAVD cgroup-bw codepath.
+ *
+ * Tagged "[PR11-BW]" so a smoke test can grep trace_pipe and confirm the
+ * throttle / consume / put-aside / replenish machinery is firing under
+ * --enable-cpu-bw load. Use cbw_pr11_rl() (rate-limited every 1024 calls)
+ * for hot paths and cbw_pr11() (unconditional) for rare events
+ * (init, put-aside, reenqueue, replenish boundary, lib_init).
+ *
+ * Disable this by reverting commit on feat/lavd-cgroup-bw-printk-debug.
+ */
+static __u64 cbw_pr11_counter SEC(".data");
+
+#define cbw_pr11(fmt, ...) do {							\
+	bpf_printk("[PR11-BW %s:%d] " fmt,					\
+		   __func__, __LINE__, ##__VA_ARGS__);				\
+} while (0)
+
+#define cbw_pr11_rl(fmt, ...) do {						\
+	__u64 _n = __sync_fetch_and_add(&cbw_pr11_counter, 1);			\
+	if ((_n & ((1ULL << 10) - 1)) == 0)					\
+		bpf_printk("[PR11-BW %s:%d n=%llu] " fmt,			\
+			   __func__, __LINE__, _n, ##__VA_ARGS__);		\
+} while (0)
+
 #define dbg_cgx(cgx, str, ...) do {						\
 	cbw_dbg(str "cgid%llu -- cgx:period_budget: %lld -- "			\
 		"cgx:runtime_total_last: %lld -- "				\
@@ -518,6 +543,8 @@ int scx_cgroup_bw_lib_init(struct scx_cgroup_bw_config *config)
 	struct bpf_timer *rp_timer, *ac_timer;
 	u32 key = 0;
 	int ret;
+
+	cbw_pr11("scx_cgroup_bw_lib_init: entered (cgroup-bw library is being initialized)");
 
 	/* If the kernel does not support cpu.max, let's stop here. */
 	if (!is_kernel_compatible()) {
@@ -1454,6 +1481,8 @@ int cbw_cgroup_bw_throttled(struct cgroup *cgrp __arg_trusted)
 __hidden
 int scx_cgroup_bw_throttled(struct cgroup *cgrp __arg_trusted, struct task_struct *p __arg_trusted)
 {
+	int ret;
+
 	/*
 	 * Never throttle an exiting task. In do_exit(), a task is removed from
 	 * the PID map by __unhash_process() (called from exit_notify()) in the
@@ -1467,7 +1496,10 @@ int scx_cgroup_bw_throttled(struct cgroup *cgrp __arg_trusted, struct task_struc
 	if (p->flags & PF_EXITING)
 		return 0;
 
-	return cbw_cgroup_bw_throttled(cgrp);
+	ret = cbw_cgroup_bw_throttled(cgrp);
+	cbw_pr11_rl("throttled? ret=%d cgid=%llu pid=%d comm=%s",
+		    ret, cgrp->kn->id, p->pid, p->comm);
+	return ret;
 }
 
 /**
@@ -1525,6 +1557,9 @@ int scx_cgroup_bw_consume(struct cgroup *cgrp __arg_trusted, u64 consumed_ns)
 
 	cbw_dbg_cgrp("  llc_id: %d -- consumed_ns: %llu -- llcx:runtime_total: %lld",
 		     llc_id, consumed_ns, READ_ONCE(llcx->runtime_total));
+	cbw_pr11_rl("consume cgid=%llu llc=%d consumed_ns=%llu runtime_total=%lld",
+		    cgrp->kn->id, llc_id, consumed_ns,
+		    READ_ONCE(llcx->runtime_total));
 	return 0;
 }
 
@@ -1607,8 +1642,13 @@ int cbw_put_aside(u64 ctx, u64 vtime, u64 cgrp_id)
 __hidden
 int scx_cgroup_bw_put_aside(struct task_struct *p __arg_trusted, u64 ctx, u64 vtime, struct cgroup *cgrp __arg_trusted)
 {
+	int ret;
+
 	cbw_dbg_cgrp(" [%s/%d]", p->comm, p->pid);
-	return cbw_put_aside(ctx, vtime, cgroup_get_id(cgrp));
+	ret = cbw_put_aside(ctx, vtime, cgroup_get_id(cgrp));
+	cbw_pr11("put_aside cgid=%llu pid=%d comm=%s vtime=%llu ret=%d",
+		 cgrp->kn->id, p->pid, p->comm, vtime, ret);
+	return ret;
 }
 
 static
@@ -2213,6 +2253,9 @@ int scx_cgroup_bw_reenqueue(void)
 	 */
 	if (likely(!cbw_has_throttled_tasks(&backlog_stat)))
 		return 0;
+
+	cbw_pr11("reenqueue: nr_throttled_cgroups=%llu — backlog detected, draining BTQs",
+		 backlog_stat.nr_throttled_cgroups);
 
 	/*
 	 * Reqneueue backlogged tasks of the throttled cgroups.
