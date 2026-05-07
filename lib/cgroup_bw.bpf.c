@@ -2488,12 +2488,24 @@ int scx_cgroup_bw_reenqueue(void)
 	 * rp_seq. If cbw_top_half_begin() fired since the snapshot was taken,
 	 * rp_seq in cbw_backlog_stat.val will have changed and the CAS will
 	 * fail safely, leaving has_throttled_tasks for the new cycle to manage.
+	 *
+	 * Bug-1 fix v3: drop the `!cbw_top_half_running()` gate. The CAS is
+	 * already TOCTOU-safe by virtue of being keyed on the full snapshot
+	 * (rp_seq + nr_throttled_cgroups + has_throttled_tasks). If the
+	 * timer has fired since the snapshot, rp_seq differs and the CAS
+	 * fails harmlessly. The original gate was redundant defense and was
+	 * preventing the has_throttled_tasks=true → false transition in
+	 * the Bug-1 stall window where the timer oscillates fast enough
+	 * that the gate was almost always TRUE.
 	 */
-	if ((nr_enq == 0) && !root_added && !cbw_top_half_running()) {
-		cbw_update_backlog_stat_cas(&backlog_stat,
-					    backlog_stat.rp_seq,
-					    backlog_stat.nr_throttled_cgroups,
-					    false);
+	if ((nr_enq == 0) && !root_added) {
+		bool ok = cbw_update_backlog_stat_cas(&backlog_stat,
+						      backlog_stat.rp_seq,
+						      backlog_stat.nr_throttled_cgroups,
+						      false);
+		if (ok) {
+			cbw_pr11("BUG1FIX: cleared has_throttled_tasks (nr_enq=0, dropped top_half gate)");
+		}
 	}
 	return 0;
 }
