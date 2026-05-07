@@ -610,9 +610,7 @@ static void update_stat_for_refill(struct task_struct *p,
 
 static bool can_direct_dispatch(struct cpu_ctx *cpuc, bool is_cpu_idle)
 {
-	return (is_cpu_idle && !queued_on_cpu(cpuc)) ||
-	       (lb_local_dsq_util_wall > 0 &&
-		cpuc->avg_util_wall < lb_local_dsq_util_wall);
+	return false;
 }
 
 s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
