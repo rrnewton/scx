@@ -822,6 +822,8 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	    (cgroup_throttled(p, taskc, true) == -EAGAIN)) {
 		debugln("Task %s[pid%d/cgid%llu] is throttled.",
 			p->comm, p->pid, taskc->cgrp_id);
+		debugln("[BUG1-DBG] enqueue.bail pid=%d cgid=%llu - dropping task from any DSQ; survival relies on scx_cgroup_bw_reenqueue() draining BTQ later",
+			p->pid, taskc->cgrp_id);
 		return;
 	}
 
@@ -1011,6 +1013,17 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 
 	cpu_dsq_id = cpu_to_dsq(cpu);
 	cpdom_dsq_id = cpdom_to_dsq(cpuc->cpdom_id);
+
+	/*
+	 * Stream B follow-up: track per-dispatch entry to see whether
+	 * lavd_dispatch is even firing on idle CPUs after the cgroup-bw
+	 * stall. prev_pid=-1 means CPU is idle entering dispatch.
+	 */
+	debugln("[BUG1-DBG] dispatch.enter cpu=%d prev_pid=%d cpdom_dsq=0x%llx nr_queued=%d",
+		cpu,
+		prev ? prev->pid : -1,
+		cpdom_dsq_id,
+		scx_bpf_dsq_nr_queued(cpdom_dsq_id));
 
 	/*
 	 * When the CPU bandwidth control is enabled, check if there are
@@ -1219,8 +1232,14 @@ consume_out:
 	/*
 	 * Otherwise, consume a task.
 	 */
-	if (consume_task(cpu_dsq_id, cpdom_dsq_id))
+	if (consume_task(cpu_dsq_id, cpdom_dsq_id)) {
+		debugln("[BUG1-DBG] dispatch.consumed cpu=%d cpdom_dsq=0x%llx",
+			cpu, cpdom_dsq_id);
 		return;
+	}
+
+	debugln("[BUG1-DBG] dispatch.empty cpu=%d cpdom_dsq=0x%llx nr_queued=%d -> consume_prev",
+		cpu, cpdom_dsq_id, scx_bpf_dsq_nr_queued(cpdom_dsq_id));
 
 	/*
 	 * If nothing to run, continue running the previous task.
@@ -1243,6 +1262,9 @@ void BPF_STRUCT_OPS(lavd_runnable, struct task_struct *p, u64 enq_flags)
 		scx_bpf_error("Failed to lookup task_ctx for task %d", p->pid);
 		return;
 	}
+	debugln("[BUG1-DBG] runnable pid=%d cgid=%llu enq_flags=0x%llx (wake=%d)",
+		p->pid, p_taskc->cgrp_id, enq_flags,
+		!!(enq_flags & SCX_ENQ_WAKEUP));
 	WRITE_ONCE(p_taskc->acc_runtime_wall, 0);
 	WRITE_ONCE(p_taskc->acc_runtime_invr, 0);
 
@@ -1467,6 +1489,8 @@ void BPF_STRUCT_OPS(lavd_quiescent, struct task_struct *p, u64 deq_flags)
 		scx_bpf_error("Failed to lookup context for task %d", p->pid);
 		return;
 	}
+	debugln("[BUG1-DBG] quiescent pid=%d cgid=%llu deq_flags=0x%llx",
+		p->pid, taskc->cgrp_id, deq_flags);
 	cpuc->flags = 0;
 
 	/*
