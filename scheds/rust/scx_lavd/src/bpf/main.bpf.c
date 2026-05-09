@@ -721,8 +721,12 @@ static int cgroup_throttled(struct task_struct *p, task_ctx *taskc, bool put_asi
 	}
 
 	ret = scx_cgroup_bw_throttled(cgrp, p);
+	debugln("[BUG1-DBG] throttled? cgid=%llu pid=%d comm=%s ret=%d put_aside=%d",
+		taskc->cgrp_id, p->pid, p->comm, ret, (int)put_aside);
 	if ((ret == -EAGAIN) && put_aside) {
 		ret2 = scx_cgroup_bw_put_aside(p, (u64)taskc, p->scx.dsq_vtime, cgrp);
+		debugln("[BUG1-DBG] put_aside cgid=%llu pid=%d vtime=%llu ret=%d",
+			taskc->cgrp_id, p->pid, p->scx.dsq_vtime, ret2);
 		if (ret2) {
 			bpf_cgroup_release(cgrp);
 			return ret2;
@@ -842,12 +846,16 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	 * to enable vtime comparison across DSQs during dispatch.
 	 */
 	if (can_direct_dispatch(cpuc, is_idle)) {
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, p->scx.slice,
-				   enq_flags);
+		dsq_id = SCX_DSQ_LOCAL_ON | cpu;
+		scx_bpf_dsq_insert(p, dsq_id, p->scx.slice, enq_flags);
+		debugln("[BUG1-DBG] enqueue local pid=%d cgid=%llu cpu=%d slice=%llu",
+			p->pid, taskc->cgrp_id, cpu, p->scx.slice);
 	} else {
 		dsq_id = get_target_dsq_id(p, cpuc, taskc);
 		scx_bpf_dsq_insert_vtime(p, dsq_id, p->scx.slice,
 					 p->scx.dsq_vtime, enq_flags);
+		debugln("[BUG1-DBG] enqueue dsq=0x%llx pid=%d cgid=%llu vtime=%llu",
+			dsq_id, p->pid, taskc->cgrp_id, p->scx.dsq_vtime);
 	}
 
 	/*
@@ -1009,8 +1017,16 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 	 * tasks backlogged when their cgroups are throttled, and requeue
 	 * those tasks to the proper DSQs.
 	 */
-	if (enable_cpu_bw && (ret = scx_cgroup_bw_reenqueue())) {
-		scx_bpf_error("Failed to reenqueue backlogged tasks: %d", ret);
+	if (enable_cpu_bw) {
+		ret = scx_cgroup_bw_reenqueue();
+		if (ret) {
+			debugln("[BUG1-DBG] dispatch.reenqueue cpu=%d ret=%d (error path)",
+				cpu, ret);
+			scx_bpf_error("Failed to reenqueue backlogged tasks: %d", ret);
+		} else {
+			traceln("[BUG1-DBG] dispatch.reenqueue cpu=%d ret=0",
+				cpu);
+		}
 	}
 
 	/*
@@ -1408,6 +1424,8 @@ void BPF_STRUCT_OPS(lavd_tick, struct task_struct *p)
 	 * is throttled before executing the task.
 	 */
 	if (enable_cpu_bw && (cgroup_throttled(p, taskc, false) == -EAGAIN)) {
+		debugln("[BUG1-DBG] tick.throttle pid=%d cgid=%llu cpu=%d -> preempt",
+			p->pid, taskc->cgrp_id, cpuc->cpu_id);
 		preempt_at_tick(p, cpuc);
 		return;
 	}
