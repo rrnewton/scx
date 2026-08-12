@@ -147,7 +147,7 @@ bool __noinline match_prefix_suffix(const char *prefix, const char *str, bool ma
 bool __noinline match_substr(const char *prefix, const char *str)
 {
 	u32 zero = 0;
-	int str_len, match_str_len, x, y;
+	int str_len, match_str_len, x, y = 0;
 
 	if (!prefix || !str) {
 		scx_bpf_error("invalid args: %s %s",
